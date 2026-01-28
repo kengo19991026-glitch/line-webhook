@@ -1,10 +1,9 @@
-const express = require("express");
-const line = require("@line/bot-sdk");
+import express from "express";
+import * as line from "@line/bot-sdk";
 
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
 
-// Cloud Run起動確認用
 app.get("/", (_req, res) => res.status(200).send("ok"));
 
 const TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
@@ -12,11 +11,14 @@ const SECRET = process.env.LINE_CHANNEL_SECRET;
 
 if (TOKEN && SECRET) {
   const config = { channelAccessToken: TOKEN, channelSecret: SECRET };
-  const client = new line.messagingApi.MessagingApiClient({ channelAccessToken: TOKEN });
+
+  const client = new line.messagingApi.MessagingApiClient({
+    channelAccessToken: TOKEN,
+  });
 
   app.post("/webhook", line.middleware(config), async (req, res) => {
     try {
-      const events = (req.body && req.body.events) || [];
+      const events = req.body?.events || [];
       for (const event of events) {
         if (event.type === "message" && event.replyToken) {
           await client.replyMessage({
