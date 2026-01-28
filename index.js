@@ -2,13 +2,11 @@ import express from "express";
 import * as line from "@line/bot-sdk";
 import OpenAI from "openai";
 
-const app = express();   // ← ★これが無いと死ぬ
+const app = express();
 const PORT = Number(process.env.PORT || 8080);
 
-// 起動確認
-app.get("/", (_req, res) => {
-  res.status(200).send("ok");
-});
+// ヘルスチェック
+app.get("/", (_req, res) => res.status(200).send("ok"));
 
 const LINE_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const LINE_SECRET = process.env.LINE_CHANNEL_SECRET;
@@ -18,7 +16,10 @@ const openai = new OpenAI({
   apiKey: OPENAI_API_KEY,
 });
 
-if (LINE_TOKEN && LINE_SECRET) {
+if (!LINE_TOKEN || !LINE_SECRET) {
+  console.log("LINE env vars are missing.");
+  app.post("/webhook", (_req, res) => res.sendStatus(200));
+} else {
   const config = {
     channelAccessToken: LINE_TOKEN,
     channelSecret: LINE_SECRET,
@@ -31,71 +32,80 @@ if (LINE_TOKEN && LINE_SECRET) {
   app.post("/webhook", line.middleware(config), async (req, res) => {
     const events = req.body?.events || [];
 
-    // 先に200を返す
+    // 先に200を返す（LINE再送防止）
     res.sendStatus(200);
 
-    for (const event of events) {
-      if (event.type !== "message") continue;
-      if (event.message?.type !== "text") continue;
-      if (!event.replyToken) continue;
+    await Promise.all(
+      events.map(async (event) => {
+        if (event.type !== "message") return;
+        if (event.message?.type !== "text") return;
+        if (!event.replyToken) return;
 
-      try {
-        const userText = event.message.text;
+        const userText = event.message.text.trim();
 
-        const response = await openai.responses.create({
-          model: "gpt-4o-mini",
-          input: [
-            {
-              role: "system",
-              content:
-                "あなたはプロの占い師AI。
-以下の構成で必ず出力する。
+        try {
+          const response = await openai.responses.create({
+            model: "gpt-4o-mini",
+            input: [
+              {
+                role: "system",
+                content: `
+あなたは共感力の高い占い師AIです。
 
-1. 現在のエネルギーの状態（2〜3文）
-2. 近い未来の流れ（2〜3文）
-3. 気をつけるべきポイント（2文）
-4. 今日の開運アクション（1〜2文）
+最初に相手の気持ちや状況をやさしく受け止め、
+「そう感じるのも自然です」「無理もありません」などの形で共感を示してください。
 
-口調は穏やかで落ち着いている。
-                相手に寄り添い理解をしている口調
-断定しすぎない。
-安心感を重視する。
-スピリチュアル寄りだが不安は煽らない。
-実際の西洋占星術に基づき事実を述べた後に
-若干の希望的観測を持たせつつ展望を語る
-  
-文字数は500〜800文字程度。",
-            },
-            { role: "user", content: userText },
-          ],
-        });
+そのうえで、
+占い・スピリチュアル・直感的な視点から、
+今の流れ、相手の内面の状態、これから起こりやすい傾向を読み取り、
+押し付けず、断定しすぎない表現で伝えてください。
 
-        const aiText =
-          response.output_text ||
-          "うまく占い結果を作れませんでした。もう一度送ってください。";
+最後に、
+相手が少し安心できるような一言アドバイスや
+心の持ち方のヒントを添えてください。
 
-        await client.replyMessage({
-          replyToken: event.replyToken,
-          messages: [{ type: "text", text: aiText }],
-        });
-      } catch (err) {
-        console.error("AI error:", err);
+口調は穏やかで落ち着いていて、やさしい。
+不安を煽らず、希望をにじませる。
+文字数は400〜600文字程度。
+箇条書きは使わず、自然な文章で書く。
+                `,
+              },
+              {
+                role: "user",
+                content: userText,
+              },
+            ],
+          });
 
-        await client.replyMessage({
-          replyToken: event.replyToken,
-          messages: [
-            {
-              type: "text",
-              text: "現在AIが混雑しています。少し時間をおいて送ってください。",
-            },
-          ],
-        });
-      }
-    }
+          const aiText =
+            response.output_text ||
+            "うまく占い文を生成できませんでした。もう一度送ってください。";
+
+          await client.replyMessage({
+            replyToken: event.replyToken,
+            messages: [
+              {
+                type: "text",
+                text: aiText.slice(0, 900),
+              },
+            ],
+          });
+        } catch (err) {
+          console.error("OpenAI error:", err);
+
+          await client.replyMessage({
+            replyToken: event.replyToken,
+            messages: [
+              {
+                type: "text",
+                text: "いま占い文の生成に失敗しました。少し時間をおいて、もう一度送ってください。",
+              },
+            ],
+          });
+        }
+      })
+    );
   });
-} else {
-  console.log("LINE env vars are missing.");
-  app.post("/webhook", (_req, res) => res.sendStatus(200));
 }
 
 app.listen(PORT, "0.0.0.0", () => {
