@@ -18,22 +18,20 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const client = new line.messagingApi.MessagingApiClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 const blobClient = new line.messagingApi.MessagingApiBlobClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 
-// --- 3. modeAI 専用プロンプト（LINE表示最適化版） ---
+// --- 3. modeAI 専用プロンプト ---
 const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」です。
 「数字は嘘をつかない」を信条とする、超ロジカルかつユーザーに寄り添うパーソナルトレーナー兼栄養士です。
 
 【重要：LINE表示用のフォーマットルール】
-LINEのトーク画面で表示されるため、以下のルールを絶対に守ってください。
-1. **Markdown記法（#, *, -）は禁止**です。「###」や「**」は絶対に使わないでください。
-2. 見出しには「■」や「【 】」を使用してください。
-3. 箇条書きには「・」を使用してください。
-4. 強調したい箇所は「」や（）を使って表現し、アスタリスク(*)は使わないでください。
+1. 見出しには「■」や「【 】」を使用してください。
+2. 箇条書きには「・」を使用してください。
+3. **Markdown記法（#や*）は禁止**です。絶対に使わないでください。
 
-【思考プロセス（内部処理）】
+【思考プロセス】
 回答前に必ずユーザーデータ（身長・体重・年齢・体脂肪率）から以下を計算してください。
 1. BMR（基礎代謝）
 2. TDEE（総消費カロリー）
-3. 目標達成のためのPFCバランス（P:高め設定）
+3. 目標達成のためのPFCバランス
 
 【回答構成】
 挨拶は手短にし、すぐに以下の形式で数値を出してください。
@@ -50,7 +48,6 @@ LINEのトーク画面で表示されるため、以下のルールを絶対に�
 （メンタルケアを含めた、プロとしての温かい一言）
 
 【プロフィール管理タグ】
-ユーザーの身体データが更新された場合のみ、回答の最後に以下を付与：
 [SAVE_PROFILE: {"weight": 数値, "height": 数値, "fatPercentage": 数値, "age": 数値, "targetWeight": 数値, "goal": "文字列"}]`;
 
 // 重複防止キャッシュ
@@ -87,9 +84,8 @@ async function handleModeAI(event) {
     const buffer = await streamToBuffer(blob);
     const base64Image = buffer.toString("base64");
     
-    // 画像送信時の指示にもフォーマット遵守を追加
     userContent = [
-      { type: "text", text: "この写真を栄養士として分析してください。Markdown記法（#や*）は使わず、■や・を使って見やすく数値を提示してください。" },
+      { type: "text", text: "この写真を栄養士として分析してください。Markdown記法は使わず、■や・を使って見やすく数値を提示してください。" },
       { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
     ];
   } else {
@@ -117,33 +113,27 @@ async function handleModeAI(event) {
       ...pastMessages,
       { role: "user", content: userContent }
     ],
-    temperature: 0.2 // フォーマット崩れを防ぐため低めに設定
+    temperature: 0.2
   });
 
   let aiResponse = completion.choices[0].message.content || "";
 
-  // --- クリーニング処理（万が一Markdownが混ざった場合の保険） ---
-  // ### や ** を削除または置換して、LINEで見やすくする
-  aiResponse = aiResponse
-    .replace(/^### /gm, "■")   // ### 見出し -> ■見出し
-    .replace(/^## /gm, "■")    // ## 見出し -> ■見出し
-    .replace(/\*\*/g, "")      // **強調** -> 強調（単に削除）
-    .replace(/^\* /gm, "・")   // * 箇条書き -> ・箇条書き
-    .replace(/^- /gm, "・");   // - 箇条書き -> ・箇条書き
-
-  // プロフィール更新処理
+  // プロフィール更新処理（クリーニング前に抽出）
   const saveMatch = aiResponse.match(/\[SAVE_PROFILE: ({.*?})\]/);
   if (saveMatch) {
     try {
       const newData = JSON.parse(saveMatch[1]);
       await db.collection("users").doc(userId).set(newData, { merge: true });
-      aiResponse = aiResponse.replace(/\[SAVE_PROFILE: {.*?}\]/g, "").trim();
     } catch (e) {}
   }
 
+  // --- 強力クリーニング処理 ---
+  // AIがタグを出しても、ここで強制的に削除・置換します
+  aiResponse = cleanMarkdown(aiResponse);
+
   await client.pushMessage({ to: userId, messages: [{ type: "text", text: aiResponse }] });
 
-  // 履歴保存
+  // 履歴保存（クリーニング後のきれいなテキストを保存）
   const historyText = event.message.type === "text" ? event.message.text : "[画像送信]";
   db.collection("users").doc(userId).collection("history").add({
     role: "user", content: historyText, createdAt: admin.firestore.FieldValue.serverTimestamp()
@@ -151,6 +141,31 @@ async function handleModeAI(event) {
   db.collection("users").doc(userId).collection("history").add({
     role: "assistant", content: aiResponse, createdAt: admin.firestore.FieldValue.serverTimestamp()
   }).catch(() => {});
+}
+
+// --- マークダウン除去専用関数 ---
+function cleanMarkdown(text) {
+  let cleaned = text;
+  
+  // 1. [SAVE_PROFILE]タグを削除（ユーザーに見せないため）
+  cleaned = cleaned.replace(/\[SAVE_PROFILE: {.*?}\]/g, "");
+
+  // 2. 太字記号 (**) を削除して中身だけ残す
+  // 例: **重要** -> 重要
+  cleaned = cleaned.replace(/\*\*(.*?)\*\*/g, "$1");
+  
+  // 3. 見出し記号 (###, ##, #) を「■」に置換
+  // 行頭にある #, ##, ### を検出
+  cleaned = cleaned.replace(/^#{1,6}\s+/gm, "■ ");
+  
+  // 4. リスト記号 (*, -) を「・」に置換
+  // 行頭にある *, - を検出
+  cleaned = cleaned.replace(/^[\*\-]\s+/gm, "・");
+
+  // 5. その他、残ったMarkdown記号を念のため削除
+  cleaned = cleaned.replace(/`/g, ""); // コードブロックのバッククォート削除
+
+  return cleaned.trim();
 }
 
 async function streamToBuffer(stream) {
