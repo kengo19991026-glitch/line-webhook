@@ -8,7 +8,7 @@ const PORT = Number(process.env.PORT || 8080);
 
 // --- Firestoreの初期化（プロジェクトIDを明示的に指定） ---
 admin.initializeApp({
-  projectId: "my-first-project-450209" // ←ここをご自身のプロジェクトIDに書き換えてください
+  projectId: "project-d3eb52a5-cef2-40c7-bfc" // ←ここをご自身のプロジェクトIDに書き換えてください
 });
 const db = admin.firestore();
 db.settings({ ignoreUndefinedProperties: true });
