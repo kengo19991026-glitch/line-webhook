@@ -23,17 +23,17 @@ const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」で
 あなたは**「どんな画像でも即座に栄養価を算出する世界最高峰のAI」**です。
 
 【最重要司令：画像解析の強制】
-ユーザーから写真が送られた場合、**「分析できない」「詳しくは分からない」「一般的な例」という発言はシステムエラーとなるため、絶対に禁止します。**
-写真が不鮮明でも、見た目が分からなくても、必ずあなたの**「推測（目視）」で料理名を断定し、具体的な数値を算出してください。**
+ユーザーから写真が送られた場合、**「分析できない」「詳しくは分からない」等の発言は禁止です。**
+写真が不鮮明でも、必ずあなたの**「推測（目視）」で料理名を断定し、具体的な数値を算出してください。**
 
 【タスク1：食事データの保存（必須）】
-食事の画像や報告があった場合、回答の最後に**必ず**以下のタグを出力してください。
+回答の最後に**必ず**以下のタグを出力してください。
 [SAVE_NUTRITION: {"food": "料理名", "kcal": 数値, "p": 数値, "f": 数値, "c": 数値}]
 ※数値は整数（例: 550）。
 
 【タスク2：集計データの統合】
-プロンプト末尾に「システム算出データ（過去の履歴）」が渡されます。
-質問に答える際は、このシステムデータと、**今まさに画像から読み取った数値**を足し合わせて回答してください。
+プロンプト末尾に「システム算出データ」が渡されます。
+質問への回答は、このシステムデータと、**今まさに画像から読み取った数値**を足し合わせて回答してください。
 
 【禁止事項】
 ・Markdown記法（#や*）の使用。
@@ -42,7 +42,7 @@ const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」で
 
 【回答構成】
 ■今回の分析結果
-・料理名：〇〇（見た目から具体的に特定）
+・料理名：〇〇（断定）
 ・カロリー：約〇〇kcal
 ・PFC：P:〇〇g / F:〇〇g / C:〇〇g
 
@@ -50,10 +50,10 @@ const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」で
 ・合計：約〇〇kcal（システム記録 + 今回の分析値）
 
 ■アドバイス
-（短く簡潔に、プロとしての次の一手）
+（短く簡潔に）
 
 【プロフィール管理タグ】
-ユーザーの身体データ（身長、体重、目標など）が提示された場合は、必ず以下を出力：
+ユーザーの身体データ提示時のみ出力：
 [SAVE_PROFILE: {"weight": 数値, "height": 数値, "fatPercentage": 数値, "age": 数値, "targetWeight": 数値, "goal": "文字列"}]`;
 
 // 重複防止キャッシュ
@@ -89,6 +89,12 @@ async function handleModeAI(event) {
     if (event.type === "message" && event.message.type === "text") {
       userContent = [{ type: "text", text: event.message.text }];
     } else if (event.type === "message" && event.message.type === "image") {
+      // ★ 即時レスポンス：不安解消のため先にメッセージを送る
+      await client.pushMessage({
+        to: userId,
+        messages: [{ type: "text", text: "画像を解析しています...少々お待ちください🍳" }]
+      });
+
       const blob = await blobClient.getMessageContent(event.message.id);
       const buffer = await streamToBuffer(blob);
       const base64Image = buffer.toString("base64");
@@ -98,7 +104,7 @@ async function handleModeAI(event) {
         { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
       ];
     } else {
-      return; // テキストと画像以外は無視
+      return; 
     }
 
     // --- データ取得 & 集計ロジック ---
@@ -107,23 +113,17 @@ async function handleModeAI(event) {
     let summary = { today: { k: 0, p: 0, f: 0, c: 0 }, week: { k: 0 }, month: { k: 0 } };
 
     try {
-      // 1. プロフィール取得（存在しなくてもエラーにしない）
+      // プロフィール取得
       const profileDoc = await db.collection("users").doc(userId).get();
-      if (profileDoc.exists) {
-        profileData = profileDoc.data();
-      } else {
-        console.log("New user or no profile data.");
-        profileData = { weight: null, goal: "未設定" };
-      }
+      if (profileDoc.exists) profileData = profileDoc.data();
 
-      // 2. 履歴取得
-      // docが存在しなくてもcollectionアクセスは空を返すだけなので安全だが、念の為tryで囲む
+      // 履歴取得
       const snap = await db.collection("users").doc(userId).collection("history").orderBy("createdAt", "desc").limit(4).get();
       if (!snap.empty) {
         pastMessages = snap.docs.reverse().map(doc => ({ role: doc.data().role, content: doc.data().content }));
       }
 
-      // 3. ログ集計（nutrition_logsがない場合も考慮）
+      // ログ集計（エラー回避のためtry内包）
       const now = new Date();
       const jstOffset = 9 * 60 * 60 * 1000;
       const jstNow = new Date(now.getTime() + jstOffset);
@@ -132,7 +132,6 @@ async function handleModeAI(event) {
       const monthStart = new Date(todayStart); monthStart.setDate(monthStart.getDate() - 29);
       const queryStartUtc = new Date(monthStart.getTime() - jstOffset);
 
-      // コレクションがなくてもエラーにならないが、念の為
       const logSnap = await db.collection("users").doc(userId).collection("nutrition_logs")
         .where("createdAt", ">=", queryStartUtc).get();
 
@@ -150,8 +149,7 @@ async function handleModeAI(event) {
         });
       }
     } catch (e) { 
-      console.warn("DB Fetch Warning (Safe to ignore for new users):", e); 
-      // DBエラーがあっても会話は続ける
+      console.log("DB Read Error (Safe):", e); 
     }
 
     const getAvg = (sum, days) => Math.round(sum / days);
@@ -185,19 +183,15 @@ ${JSON.stringify(profileData)}
 
     let aiResponse = completion.choices[0].message.content || "";
 
-    // --- 保存処理（ここでのエラーは会話を止めない） ---
-    // 1. プロフィール保存
+    // --- 保存処理 ---
     const saveProfileMatch = aiResponse.match(/\[SAVE_PROFILE: (\{[\s\S]*?\})\]/);
     if (saveProfileMatch) {
       try {
         const newData = JSON.parse(saveProfileMatch[1]);
-        // merge: true で保存（ドキュメントがなければ作成される）
         await db.collection("users").doc(userId).set(newData, { merge: true });
-        console.log("Profile Saved Successfully");
-      } catch (e) { console.error("Profile Save Error:", e); }
+      } catch (e) {}
     }
 
-    // 2. 食事ログ保存
     const saveNutritionMatch = aiResponse.match(/\[SAVE_NUTRITION: (\{[\s\S]*?\})\]/);
     if (saveNutritionMatch) {
       try {
@@ -205,10 +199,9 @@ ${JSON.stringify(profileData)}
         const nutritionData = JSON.parse(jsonStr);
         await db.collection("users").doc(userId).collection("nutrition_logs").add({
           ...nutritionData,
-          createdAt: admin.firestore.FieldValue.serverTimestamp() // サーバー側でタイムスタンプ付与
+          createdAt: admin.firestore.FieldValue.serverTimestamp()
         });
-        console.log("Nutrition Log Saved");
-      } catch (e) { console.error("Nutrition Save Error:", e); }
+      } catch (e) {}
     }
 
     // --- クリーニング ---
@@ -216,16 +209,47 @@ ${JSON.stringify(profileData)}
 
     await client.pushMessage({ to: userId, messages: [{ type: "text", text: aiResponse }] });
 
-    // 履歴保存（非同期で投げっぱなし）
+    // 履歴保存
     const historyText = event.message.type === "text" ? event.message.text : "[画像送信]";
     db.collection("users").doc(userId).collection("history").add({
       role: "user", content: historyText, createdAt: admin.firestore.FieldValue.serverTimestamp()
-    }).catch(e => console.error("History Save Error:", e));
+    }).catch(e => {});
     
     db.collection("users").doc(userId).collection("history").add({
       role: "assistant", content: aiResponse, createdAt: admin.firestore.FieldValue.serverTimestamp()
-    }).catch(e => console.error("History Save Error:", e));
+    }).catch(e => {});
 
   } catch (error) {
-    console.error("Main Process Critical Error:", error);
-    // ユーザーに適切なエラーメッセージを返す
+    console.error("Critical Error:", error);
+    // ユーザーにエラーを通知
+    const errorMsg = "申し訳ありません。処理中にエラーが発生しました（タイムアウト等の可能性があります）。もう一度お試しいただくか、少し時間をおいてください。";
+    try {
+        await client.pushMessage({ to: userId, messages: [{ type: "text", text: errorMsg }] });
+    } catch(e) {
+        console.error("Failed to send error message:", e);
+    }
+  }
+}
+
+// --- マークダウン除去専用関数 ---
+function cleanMarkdown(text) {
+  let cleaned = text;
+  cleaned = cleaned.replace(/\[SAVE_PROFILE: \{[\s\S]*?\}\]/g, "");
+  cleaned = cleaned.replace(/\[SAVE_NUTRITION: \{[\s\S]*?\}\]/g, "");
+  cleaned = cleaned.replace(/\*\*(.*?)\*\*/g, "$1");
+  cleaned = cleaned.replace(/^#{1,6}\s+/gm, "■ ");
+  cleaned = cleaned.replace(/^[\*\-]\s+/gm, "・");
+  cleaned = cleaned.replace(/`/g, "");
+  return cleaned.trim();
+}
+
+async function streamToBuffer(stream) {
+  const chunks = [];
+  return new Promise((resolve, reject) => {
+    stream.on("data", (chunk) => chunks.push(chunk));
+    stream.on("error", reject);
+    stream.on("end", () => resolve(Buffer.concat(chunks)));
+  });
+}
+
+app.listen(PORT, "0.0.0.0");
