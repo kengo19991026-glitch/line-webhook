@@ -18,7 +18,7 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const client = new line.messagingApi.MessagingApiClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 const blobClient = new line.messagingApi.MessagingApiBlobClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 
-// --- 3. modeAI 専用プロンプト ---
+// --- 3. modeAI 専用プロンプト（ログ保存機能追加） ---
 const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」です。
 「数字は嘘をつかない」を信条とする、超ロジカルかつユーザーに寄り添うパーソナルトレーナー兼栄養士です。
 
@@ -32,6 +32,11 @@ const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」で
 1. BMR（基礎代謝）
 2. TDEE（総消費カロリー）
 3. 目標達成のためのPFCバランス
+
+【食事データの記録（重要）】
+ユーザーから食事の報告（画像またはテキスト）があった場合、その食事の「推定カロリー」と「PFC」を抽出し、回答の末尾に以下のタグを出力してデータベースに保存してください。
+[SAVE_NUTRITION: {"food": "料理名", "kcal": 数値, "p": 数値, "f": 数値, "c": 数値}]
+※数値は概算で構いません（単位なしの数字のみ）。
 
 【回答構成】
 挨拶は手短にし、すぐに以下の形式で数値を出してください。
@@ -85,7 +90,7 @@ async function handleModeAI(event) {
     const base64Image = buffer.toString("base64");
     
     userContent = [
-      { type: "text", text: "この写真を栄養士として分析してください。Markdown記法は使わず、■や・を使って見やすく数値を提示してください。" },
+      { type: "text", text: "この写真を栄養士として分析してください。Markdown記法は使わず、■や・を使って見やすく数値を提示してください。また、栄養データ保存用のタグも忘れずに出力してください。" },
       { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
     ];
   } else {
@@ -118,22 +123,37 @@ async function handleModeAI(event) {
 
   let aiResponse = completion.choices[0].message.content || "";
 
-  // プロフィール更新処理（クリーニング前に抽出）
-  const saveMatch = aiResponse.match(/\[SAVE_PROFILE: ({.*?})\]/);
-  if (saveMatch) {
+  // --- 1. プロフィール保存処理 ---
+  const saveProfileMatch = aiResponse.match(/\[SAVE_PROFILE: ({.*?})\]/);
+  if (saveProfileMatch) {
     try {
-      const newData = JSON.parse(saveMatch[1]);
+      const newData = JSON.parse(saveProfileMatch[1]);
       await db.collection("users").doc(userId).set(newData, { merge: true });
     } catch (e) {}
   }
 
-  // --- 強力クリーニング処理 ---
-  // AIがタグを出しても、ここで強制的に削除・置換します
+  // --- 2. 食事ログ保存処理（新規追加） ---
+  const saveNutritionMatch = aiResponse.match(/\[SAVE_NUTRITION: ({.*?})\]/);
+  if (saveNutritionMatch) {
+    try {
+      const nutritionData = JSON.parse(saveNutritionMatch[1]);
+      // 日時情報(createdAt)を付与して nutrition_logs コレクションに保存
+      await db.collection("users").doc(userId).collection("nutrition_logs").add({
+        ...nutritionData,
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      console.log(`[LOG] Nutrition saved for user: ${userId}`);
+    } catch (e) {
+      console.error("[ERROR] Nutrition save failed:", e);
+    }
+  }
+
+  // --- クリーニング処理 ---
   aiResponse = cleanMarkdown(aiResponse);
 
   await client.pushMessage({ to: userId, messages: [{ type: "text", text: aiResponse }] });
 
-  // 履歴保存（クリーニング後のきれいなテキストを保存）
+  // 履歴保存
   const historyText = event.message.type === "text" ? event.message.text : "[画像送信]";
   db.collection("users").doc(userId).collection("history").add({
     role: "user", content: historyText, createdAt: admin.firestore.FieldValue.serverTimestamp()
@@ -147,23 +167,15 @@ async function handleModeAI(event) {
 function cleanMarkdown(text) {
   let cleaned = text;
   
-  // 1. [SAVE_PROFILE]タグを削除（ユーザーに見せないため）
+  // 保存用タグをユーザーに見せないように削除
   cleaned = cleaned.replace(/\[SAVE_PROFILE: {.*?}\]/g, "");
+  cleaned = cleaned.replace(/\[SAVE_NUTRITION: {.*?}\]/g, "");
 
-  // 2. 太字記号 (**) を削除して中身だけ残す
-  // 例: **重要** -> 重要
-  cleaned = cleaned.replace(/\*\*(.*?)\*\*/g, "$1");
-  
-  // 3. 見出し記号 (###, ##, #) を「■」に置換
-  // 行頭にある #, ##, ### を検出
-  cleaned = cleaned.replace(/^#{1,6}\s+/gm, "■ ");
-  
-  // 4. リスト記号 (*, -) を「・」に置換
-  // 行頭にある *, - を検出
-  cleaned = cleaned.replace(/^[\*\-]\s+/gm, "・");
-
-  // 5. その他、残ったMarkdown記号を念のため削除
-  cleaned = cleaned.replace(/`/g, ""); // コードブロックのバッククォート削除
+  // マークダウン記号の削除・置換
+  cleaned = cleaned.replace(/\*\*(.*?)\*\*/g, "$1"); // 太字
+  cleaned = cleaned.replace(/^#{1,6}\s+/gm, "■ "); // 見出し
+  cleaned = cleaned.replace(/^[\*\-]\s+/gm, "・"); // リスト
+  cleaned = cleaned.replace(/`/g, ""); // バッククォート
 
   return cleaned.trim();
 }
