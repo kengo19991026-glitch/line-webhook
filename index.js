@@ -13,25 +13,19 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
+// --- プロンプトをトレーナー・栄養士・カウンセラー用に刷新 ---
 const SYSTEM_PROMPT = [
-  "あなたは共感力の高い占い師AIです。",
+  "あなたは、以下の3つの専門性を持つ『究極のパーソナル・ヘルスケア・アドバイザー』です。",
   "",
-  "最初に相手の気持ちや状況をやさしく受け止め、",
-  "「そう感じるのも自然です」「無理もありません」などの形で共感を示してください。",
+  "1. 【超一流パーソナルトレーナー】: 運動に対し、解剖学に基づいた具体的な改善点や効かせ方を指導します。",
+  "2. 【専門管理栄養士】: 食事に対し、PFCバランスや栄養素の観点から具体的で実践的なアドバイスをします。",
+  "3. 【共感型カウンセラー】: ユーザーの悩みや疲れに寄り添い、心理学的にモチベーションを支えます。",
   "",
-  "そのうえで、",
-  "占い・スピリチュアル・直感的な視点から、",
-  "今の流れ、相手の内面の状態、これから起こりやすい傾向を読み取り、",
-  "押し付けず、断定しすぎない表現で伝えてください。",
-  "",
-  "最後に、",
-  "相手が少し安心できるような一言アドバイスや",
-  "心の持ち方のヒントを添えてください。",
-  "",
-  "口調は穏やかで落ち着いていて、やさしい。",
-  "不安を煽らず、希望をにじませる。",
-  "文字数は400〜600文字程度。",
-  "箇条書きは使わず、自然な文章で書く。"
+  "【回答ルール】",
+  "・常に「私たちはチームです」という温かい姿勢で接してください。",
+  "・LINEで読みやすいよう、適宜改行や絵文字、箇条書きを使ってください。",
+  "・ユーザーの入力が「食事」「運動」「悩み」のどれに該当するか判断し、最適な専門家として回答してください（複数が混ざってもOK）。",
+  "・1回の返信は、スマホ画面で読みきれる程度の長さにまとめてください。"
 ].join("\n");
 
 if (!LINE_TOKEN || !LINE_SECRET) {
@@ -43,42 +37,38 @@ if (!LINE_TOKEN || !LINE_SECRET) {
 
   app.post("/webhook", line.middleware(config), async (req, res) => {
     const events = req.body?.events || [];
-
-    // 先に200（LINE再送防止）
     res.sendStatus(200);
 
     await Promise.all(events.map(async (event) => {
-      if (event.type !== "message") return;
-      if (event.message?.type !== "text") return;
+      if (event.type !== "message" || event.message?.type !== "text") return;
       if (!event.replyToken) return;
 
       const userText = (event.message.text || "").trim();
 
       try {
-        const response = await openai.responses.create({
-          model: "gpt-4o-mini",
-          input: [
+        // OpenAI Chat Completion API (v4系の標準的な書き方に修正)
+        const completion = await openai.chat.completions.create({
+          model: "gpt-4o", // より高精度な回答のためにgpt-4oを推奨（gpt-4o-miniでも可）
+          messages: [
             { role: "system", content: SYSTEM_PROMPT },
             { role: "user", content: userText }
           ],
         });
 
-        const aiText =
-          response.output_text ||
-          "うまく占い文を生成できませんでした。もう一度送ってください。";
+        const aiText = completion.choices[0].message.content || "申し訳ありません。回答を生成できませんでした。";
 
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: "text", text: aiText.slice(0, 900) }],
+          messages: [{ type: "text", text: aiText }],
         });
       } catch (err) {
-        console.error("OpenAI error:", err?.status, err?.message || err);
+        console.error("OpenAI error:", err);
 
         await client.replyMessage({
           replyToken: event.replyToken,
           messages: [{
             type: "text",
-            text: "いま占い文の生成に失敗しました。少し時間をおいて、もう一度送ってください。",
+            text: "通信エラーが発生しました。少し時間をおいてから再度話しかけてくださいね！",
           }],
         });
       }
