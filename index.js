@@ -18,21 +18,31 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const client = new line.messagingApi.MessagingApiClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 const blobClient = new line.messagingApi.MessagingApiBlobClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 
-// --- 3. modeAI 専用プロンプト（2モード統合 ＆ メンタルケア内包） ---
+// --- 3. modeAI 専用プロンプト（数値化の強制と人格の統合） ---
 const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」です。
-大人のための洗練されたアドバイザーとして、以下の2つの専門視点を「メンタルケア」で包み込んで提供してください。
+大人のための洗練されたアドバイザーとして、トレーナー・栄養士の専門知識を「深いメンタルケア」で包み込んで提供してください。
+
+【食事画像解析の絶対ルール】
+画像が送られてきた場合、必ず冒頭に以下の「推定数値データ」を構造化して提示してください。
+1. 料理名
+2. 推定総カロリー (kcal)
+3. PFCバランスの推定値 (P:タンパク質, F:脂質, C:炭水化物) を「g（グラム）」で。
+
+回答の開始例：
+「お疲れ様です。お食事の写真を拝見しました。分析結果をご報告しますね。
+■分析データ
+・料理：〇〇
+・熱量：約000kcal
+・PFC：P:00g / F:00g / C:00g」
 
 【人格とスタンス】
-・「カウンセラーモード」は存在しません。代わりに、すべての発言に「ユーザーの心に寄り添う激励とケア」を込めてください。
-・厳しい数値を突きつけるだけでなく、その背景にあるユーザーの努力を肯定し、挫折しそうな時に静かに背中を押す大人な優しさを持ってください。
+・カウンセラーモードは廃止しましたが、すべての回答に「激励と共感」を込めてください。
+・数値はプロとして正確に出しつつ、その後のアドバイスでは「この一食があなたの明日の力になります」といった、大人の余裕と優しさを持って接してください。
+・否定はせず、改善点を伝える際も「こうするとさらに効率的です」とポジティブに導いてください。
 
-【2つの専門視点】
-1. トレーナー視点: 解剖学・生理学に基づいた理論的な指導。ただし、筋肉を追い込むことだけを目的とせず、ユーザーの体調やメンタルに合わせた最適な負荷を提案してください。
-2. 栄養士視点: PFCバランスや血糖値の科学的な分析。単なる制限ではなく、食を楽しむ心の充足感も考慮した、持続可能な食事を提案してください。
-
-【画像解析とデータ活用】
-・写真解析時は栄養士として冷静に分析しつつ、トレーナーとして「これが次のエネルギーになります」といった前向きな言葉を添えてください。
-・[SAVE_PROFILE] タグを用いて身長・体重・体脂肪率・目標を管理してください。`;
+【プロフィール管理】
+[SAVE_PROFILE: {"weight": 数値, "height": 数値, "fatPercentage": 数値, "targetWeight": 数値, "goal": "文字列"}]
+の形式を末尾に付与して、ユーザーデータを更新してください。`;
 
 const eventCache = new Set();
 
@@ -60,7 +70,7 @@ async function handleModeAI(event) {
   const userId = event.source.userId;
   let userContent;
 
-  // メッセージ判別
+  // メッセージ判別（テキストか画像か）
   if (event.type === "message" && event.message.type === "text") {
     userContent = [{ type: "text", text: event.message.text }];
   } else if (event.type === "message" && event.message.type === "image") {
@@ -68,7 +78,7 @@ async function handleModeAI(event) {
     const buffer = await streamToBuffer(blob);
     const base64Image = buffer.toString("base64");
     userContent = [
-      { type: "text", text: "この写真を分析し、私に寄り添ったアドバイスをください。" },
+      { type: "text", text: "この写真を分析し、カロリーとPFCバランスを数値で教えてください。その上で私に寄り添ったアドバイスを。" },
       { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
     ];
   } else {
@@ -87,14 +97,16 @@ async function handleModeAI(event) {
     }
   } catch (e) { console.error("DB Error:", e); }
 
-  // OpenAI 呼び出し
+  // OpenAI 呼び出し（数値の安定性を高める設定）
   const completion = await openai.chat.completions.create({
     model: "gpt-4o",
     messages: [
       { role: "system", content: SYSTEM_PROMPT + "\n【現状】" + JSON.stringify(profileData) },
       ...pastMessages,
       { role: "user", content: userContent }
-    ]
+    ],
+    temperature: 0.3, // 数値の推測をより堅実にするため低めに設定
+    max_tokens: 1000
   });
 
   let aiResponse = completion.choices[0].message.content || "";
@@ -112,7 +124,7 @@ async function handleModeAI(event) {
   await client.pushMessage({ to: userId, messages: [{ type: "text", text: aiResponse }] });
 
   // 履歴保存
-  const historyText = event.message.type === "text" ? event.message.text : "[画像を送信]";
+  const historyText = event.message.type === "text" ? event.message.text : "[食事画像を送信]";
   db.collection("users").doc(userId).collection("history").add({
     role: "user", content: historyText, createdAt: admin.firestore.FieldValue.serverTimestamp()
   }).catch(() => {});
