@@ -18,17 +18,17 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const client = new line.messagingApi.MessagingApiClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 const blobClient = new line.messagingApi.MessagingApiBlobClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 
-// --- 3. modeAI 専用プロンプト（画像解析・絶対優先版） ---
+// --- 3. modeAI 専用プロンプト（画像解析・絶対強制版） ---
 const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」です。
-あなたは**「世界最高峰の画像認識能力を持つAI栄養士」**です。
+あなたは**「どんな画像でも即座に栄養価を算出する世界最高峰のAI」**です。
 
 【最重要司令：画像解析の強制】
-ユーザーから写真が送られた場合、**「分析できない」「詳しくは分からない」という発言は固く禁じます。**
-たとえ写真が不鮮明でも、一部しか写っていなくても、必ずあなたの**「推測（目視）」**で以下の数値を断定して出力してください。
-※システム上の過去データに頼らず、**今見ている画像**を最優先で分析してください。
+ユーザーから写真が送られた場合、**「分析できない」「詳しくは分からない」「一般的な例」という発言はシステムエラーとなるため、絶対に禁止します。**
+写真が不鮮明でも、見た目が分からなくても、必ずあなたの**「推測（目視）」で料理名を断定し、具体的な数値を算出してください。**
+「お弁当に見えますが...」といった前置きも不要です。プロとして断定してください。
 
 【タスク1：食事データの保存（必須）】
-分析結果の数値は、以下の形式の隠しタグとして**必ず**出力してください。
+食事の画像や報告があった場合、回答の最後に**必ず**以下のタグを出力してください。
 [SAVE_NUTRITION: {"food": "料理名", "kcal": 数値, "p": 数値, "f": 数値, "c": 数値}]
 ※数値は整数（例: 550）。
 
@@ -39,6 +39,7 @@ const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」で
 【禁止事項】
 ・Markdown記法（#や*）の使用。
 ・「推測ですが」「正確ではありませんが」といった自信のない前置き。
+・分析の拒否。
 
 【回答構成】
 ■今回の分析結果
@@ -80,72 +81,77 @@ app.post("/webhook", line.middleware({
 
 async function handleModeAI(event) {
   const userId = event.source.userId;
-  let userContent;
-
-  if (event.type === "message" && event.message.type === "text") {
-    userContent = [{ type: "text", text: event.message.text }];
-  } else if (event.type === "message" && event.message.type === "image") {
-    const blob = await blobClient.getMessageContent(event.message.id);
-    const buffer = await streamToBuffer(blob);
-    const base64Image = buffer.toString("base64");
-    
-    // 画像送信時の指示を「推測許可」に変更
-    userContent = [
-      { type: "text", text: "この料理の写真を分析してください。「分析できない」は禁止です。見た目から大胆に推測し、具体的なカロリーとPFCを数値で断定してください。必ず末尾に [SAVE_NUTRITION] タグを出力すること。" },
-      { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
-    ];
-  } else {
-    return;
-  }
-
-  // --- データ取得 & 集計ロジック ---
-  let profileData = {};
-  let pastMessages = [];
-  let summary = { today: { k: 0, p: 0, f: 0, c: 0 }, week: { k: 0 }, month: { k: 0 } };
-
+  
+  // --- エラーハンドリング（クラッシュ防止） ---
   try {
-    const profileDoc = await db.collection("users").doc(userId).get();
-    profileData = profileDoc.exists ? profileDoc.data() : { weight: null };
+    let userContent;
 
-    const snap = await db.collection("users").doc(userId).collection("history").orderBy("createdAt", "desc").limit(4).get();
-    if (!snap.empty) {
-      pastMessages = snap.docs.reverse().map(doc => ({ role: doc.data().role, content: doc.data().content }));
+    if (event.type === "message" && event.message.type === "text") {
+      userContent = [{ type: "text", text: event.message.text }];
+    } else if (event.type === "message" && event.message.type === "image") {
+      const blob = await blobClient.getMessageContent(event.message.id);
+      const buffer = await streamToBuffer(blob);
+      const base64Image = buffer.toString("base64");
+      
+      // 画像送信時の指示を「最強」にする
+      userContent = [
+        { type: "text", text: "この料理の写真を分析せよ。「分析できない」等の言い訳は一切認めない。不鮮明でも推測し、必ず料理名と数値を断定して出力せよ。末尾に [SAVE_NUTRITION] タグを出力すること。" },
+        { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
+      ];
+    } else {
+      return;
     }
 
-    // ログ集計
-    const now = new Date();
-    const jstOffset = 9 * 60 * 60 * 1000;
-    const jstNow = new Date(now.getTime() + jstOffset);
-    const todayStart = new Date(jstNow); todayStart.setUTCHours(0, 0, 0, 0); 
-    const weekStart = new Date(todayStart); weekStart.setDate(weekStart.getDate() - 6);
-    const monthStart = new Date(todayStart); monthStart.setDate(monthStart.getDate() - 29);
-    const queryStartUtc = new Date(monthStart.getTime() - jstOffset);
+    // --- データ取得 & 集計ロジック ---
+    let profileData = {};
+    let pastMessages = [];
+    let summary = { today: { k: 0, p: 0, f: 0, c: 0 }, week: { k: 0 }, month: { k: 0 } };
 
-    let logSnap = { empty: true, forEach: () => {} };
     try {
-      logSnap = await db.collection("users").doc(userId).collection("nutrition_logs")
-        .where("createdAt", ">=", queryStartUtc).get();
-    } catch (e) {}
+      const profileDoc = await db.collection("users").doc(userId).get();
+      profileData = profileDoc.exists ? profileDoc.data() : { weight: null };
 
-    if (!logSnap.empty) {
-      logSnap.forEach(doc => {
-        const d = doc.data();
-        const logDateJst = new Date(d.createdAt.toDate().getTime() + jstOffset);
-        const vals = { k: Number(d.kcal)||0, p: Number(d.p)||0, f: Number(d.f)||0, c: Number(d.c)||0 };
-        
-        summary.month.k += vals.k;
-        if (logDateJst >= new Date(weekStart.getTime() - jstOffset)) summary.week.k += vals.k;
-        if (logDateJst >= new Date(todayStart.getTime() - jstOffset)) {
-            summary.today.k += vals.k; summary.today.p += vals.p; summary.today.f += vals.f; summary.today.c += vals.c;
-        }
-      });
-    }
-  } catch (e) { console.error("DB Error:", e); }
+      const snap = await db.collection("users").doc(userId).collection("history").orderBy("createdAt", "desc").limit(4).get();
+      if (!snap.empty) {
+        pastMessages = snap.docs.reverse().map(doc => ({ role: doc.data().role, content: doc.data().content }));
+      }
 
-  const getAvg = (sum, days) => Math.round(sum / days);
+      // ログ集計
+      const now = new Date();
+      const jstOffset = 9 * 60 * 60 * 1000;
+      const jstNow = new Date(now.getTime() + jstOffset);
+      const todayStart = new Date(jstNow); todayStart.setUTCHours(0, 0, 0, 0); 
+      const weekStart = new Date(todayStart); weekStart.setDate(weekStart.getDate() - 6);
+      const monthStart = new Date(todayStart); monthStart.setDate(monthStart.getDate() - 29);
+      const queryStartUtc = new Date(monthStart.getTime() - jstOffset);
 
-  // システムメッセージ作成（画像解析を邪魔しない文言に修正）
-  const dynamicSystemMessage = `
+      let logSnap = { empty: true, forEach: () => {} };
+      try {
+        logSnap = await db.collection("users").doc(userId).collection("nutrition_logs")
+          .where("createdAt", ">=", queryStartUtc).get();
+      } catch (e) {
+         // コレクションがない場合は無視
+      }
+
+      if (!logSnap.empty) {
+        logSnap.forEach(doc => {
+          const d = doc.data();
+          const logDateJst = new Date(d.createdAt.toDate().getTime() + jstOffset);
+          const vals = { k: Number(d.kcal)||0, p: Number(d.p)||0, f: Number(d.f)||0, c: Number(d.c)||0 };
+          
+          summary.month.k += vals.k;
+          if (logDateJst >= new Date(weekStart.getTime() - jstOffset)) summary.week.k += vals.k;
+          if (logDateJst >= new Date(todayStart.getTime() - jstOffset)) {
+              summary.today.k += vals.k; summary.today.p += vals.p; summary.today.f += vals.f; summary.today.c += vals.c;
+          }
+        });
+      }
+    } catch (e) { console.error("DB Error:", e); }
+
+    const getAvg = (sum, days) => Math.round(sum / days);
+
+    // システムメッセージ作成
+    const dynamicSystemMessage = `
 ${SYSTEM_PROMPT}
 
 【システム算出データ（参考情報）】
@@ -159,54 +165,63 @@ ${SYSTEM_PROMPT}
 ${JSON.stringify(profileData)}
 `;
 
-  // OpenAI 呼び出し（画像解析の自由度を高めるためTemperatureを調整）
-  const completion = await openai.chat.completions.create({
-    model: "gpt-4o",
-    messages: [
-      { role: "system", content: dynamicSystemMessage },
-      ...pastMessages,
-      { role: "user", content: userContent }
-    ],
-    temperature: 0.5, // 0.2だと保守的になりすぎて「分からない」と言うため、少し上げる
-    max_tokens: 1000
-  });
+    // OpenAI 呼び出し
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o",
+      messages: [
+        { role: "system", content: dynamicSystemMessage },
+        ...pastMessages,
+        { role: "user", content: userContent }
+      ],
+      temperature: 0.7, // 創造性を高めて「推測」させる
+      max_tokens: 1000
+    });
 
-  let aiResponse = completion.choices[0].message.content || "";
+    let aiResponse = completion.choices[0].message.content || "";
 
-  // --- 保存処理 ---
-  const saveNutritionMatch = aiResponse.match(/\[SAVE_NUTRITION: (\{[\s\S]*?\})\]/);
-  if (saveNutritionMatch) {
-    try {
-      const jsonStr = saveNutritionMatch[1];
-      const nutritionData = JSON.parse(jsonStr);
-      await db.collection("users").doc(userId).collection("nutrition_logs").add({
-        ...nutritionData,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-    } catch (e) {}
+    // --- 保存処理 ---
+    const saveNutritionMatch = aiResponse.match(/\[SAVE_NUTRITION: (\{[\s\S]*?\})\]/);
+    if (saveNutritionMatch) {
+      try {
+        const jsonStr = saveNutritionMatch[1];
+        const nutritionData = JSON.parse(jsonStr);
+        await db.collection("users").doc(userId).collection("nutrition_logs").add({
+          ...nutritionData,
+          createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+      } catch (e) { console.error("Save Nutrition Error", e); }
+    }
+
+    const saveProfileMatch = aiResponse.match(/\[SAVE_PROFILE: (\{[\s\S]*?\})\]/);
+    if (saveProfileMatch) {
+      try {
+        const newData = JSON.parse(saveProfileMatch[1]);
+        await db.collection("users").doc(userId).set(newData, { merge: true });
+      } catch (e) {}
+    }
+
+    // --- クリーニング ---
+    aiResponse = cleanMarkdown(aiResponse);
+
+    await client.pushMessage({ to: userId, messages: [{ type: "text", text: aiResponse }] });
+
+    // 履歴保存
+    const historyText = event.message.type === "text" ? event.message.text : "[画像送信]";
+    db.collection("users").doc(userId).collection("history").add({
+      role: "user", content: historyText, createdAt: admin.firestore.FieldValue.serverTimestamp()
+    }).catch(() => {});
+    db.collection("users").doc(userId).collection("history").add({
+      role: "assistant", content: aiResponse, createdAt: admin.firestore.FieldValue.serverTimestamp()
+    }).catch(() => {});
+
+  } catch (error) {
+    console.error("Main Process Error:", error);
+    // ユーザーにエラーを通知（既読スルーを防ぐ）
+    await client.pushMessage({ 
+        to: userId, 
+        messages: [{ type: "text", text: "申し訳ありません。処理中にエラーが発生しました。もう一度画像を送信してください。" }] 
+    });
   }
-
-  const saveProfileMatch = aiResponse.match(/\[SAVE_PROFILE: (\{[\s\S]*?\})\]/);
-  if (saveProfileMatch) {
-    try {
-      const newData = JSON.parse(saveProfileMatch[1]);
-      await db.collection("users").doc(userId).set(newData, { merge: true });
-    } catch (e) {}
-  }
-
-  // --- クリーニング ---
-  aiResponse = cleanMarkdown(aiResponse);
-
-  await client.pushMessage({ to: userId, messages: [{ type: "text", text: aiResponse }] });
-
-  // 履歴保存
-  const historyText = event.message.type === "text" ? event.message.text : "[画像送信]";
-  db.collection("users").doc(userId).collection("history").add({
-    role: "user", content: historyText, createdAt: admin.firestore.FieldValue.serverTimestamp()
-  }).catch(() => {});
-  db.collection("users").doc(userId).collection("history").add({
-    role: "assistant", content: aiResponse, createdAt: admin.firestore.FieldValue.serverTimestamp()
-  }).catch(() => {});
 }
 
 // --- マークダウン除去専用関数 ---
