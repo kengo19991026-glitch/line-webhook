@@ -23,7 +23,7 @@ const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」で
 あなたは**「どんな画像でも即座に栄養価を算出する世界最高峰のAI」**です。
 
 【最重要司令：画像解析の強制】
-ユーザーから写真が送られた場合、**「分析できない」「詳しくは分からない」等の発言は禁止です。**
+ユーザーから写真が送られた場合、**「分析できない」「詳しくは分からない」等の発言はシステムエラーとなるため、絶対に禁止します。**
 写真が不鮮明でも、必ずあなたの**「推測（目視）」で料理名を断定し、具体的な数値を算出してください。**
 
 【タスク1：食事データの保存（必須）】
@@ -59,11 +59,18 @@ const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」で
 // 重複防止キャッシュ
 const eventCache = new Set();
 
+// --- ヘルスチェック用エンドポイント（Cloud Runの生存確認用） ---
+app.get("/", (req, res) => {
+  res.status(200).send("modeAI is running!");
+});
+
 app.post("/webhook", line.middleware({ 
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN, 
   channelSecret: process.env.LINE_CHANNEL_SECRET 
 }), (req, res) => {
+  // LINEサーバーへ即座に200を返す（タイムアウト防止）
   res.status(200).send("OK");
+  
   const events = req.body.events || [];
 
   events.forEach(async (event) => {
@@ -74,7 +81,7 @@ app.post("/webhook", line.middleware({
     try {
       await handleModeAI(event);
     } catch (err) {
-      console.error("Fatal Event Error:", err);
+      console.error("Event Processing Error:", err);
     }
   });
 });
@@ -90,10 +97,12 @@ async function handleModeAI(event) {
       userContent = [{ type: "text", text: event.message.text }];
     } else if (event.type === "message" && event.message.type === "image") {
       // ★ 即時レスポンス：不安解消のため先にメッセージを送る
-      await client.pushMessage({
-        to: userId,
-        messages: [{ type: "text", text: "画像を解析しています...少々お待ちください🍳" }]
-      });
+      try {
+        await client.pushMessage({
+          to: userId,
+          messages: [{ type: "text", text: "画像を解析しています...少々お待ちください🍳" }]
+        });
+      } catch (e) { console.error("Push Error:", e); }
 
       const blob = await blobClient.getMessageContent(event.message.id);
       const buffer = await streamToBuffer(blob);
@@ -123,7 +132,7 @@ async function handleModeAI(event) {
         pastMessages = snap.docs.reverse().map(doc => ({ role: doc.data().role, content: doc.data().content }));
       }
 
-      // ログ集計（エラー回避のためtry内包）
+      // ログ集計
       const now = new Date();
       const jstOffset = 9 * 60 * 60 * 1000;
       const jstNow = new Date(now.getTime() + jstOffset);
@@ -149,7 +158,7 @@ async function handleModeAI(event) {
         });
       }
     } catch (e) { 
-      console.log("DB Read Error (Safe):", e); 
+      console.log("DB Read Error (Safe to ignore):", e); 
     }
 
     const getAvg = (sum, days) => Math.round(sum / days);
@@ -211,23 +220,20 @@ ${JSON.stringify(profileData)}
 
     // 履歴保存
     const historyText = event.message.type === "text" ? event.message.text : "[画像送信]";
-    db.collection("users").doc(userId).collection("history").add({
-      role: "user", content: historyText, createdAt: admin.firestore.FieldValue.serverTimestamp()
-    }).catch(e => {});
-    
-    db.collection("users").doc(userId).collection("history").add({
-      role: "assistant", content: aiResponse, createdAt: admin.firestore.FieldValue.serverTimestamp()
-    }).catch(e => {});
+    try {
+      await db.collection("users").doc(userId).collection("history").add({
+        role: "user", content: historyText, createdAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      await db.collection("users").doc(userId).collection("history").add({
+        role: "assistant", content: aiResponse, createdAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+    } catch(e) { console.error("History Save Error", e); }
 
   } catch (error) {
-    console.error("Critical Error:", error);
-    // ユーザーにエラーを通知
-    const errorMsg = "申し訳ありません。処理中にエラーが発生しました（タイムアウト等の可能性があります）。もう一度お試しいただくか、少し時間をおいてください。";
+    console.error("Critical Error in handleModeAI:", error);
     try {
-        await client.pushMessage({ to: userId, messages: [{ type: "text", text: errorMsg }] });
-    } catch(e) {
-        console.error("Failed to send error message:", e);
-    }
+        await client.pushMessage({ to: userId, messages: [{ type: "text", text: "エラーが発生しました。もう一度お試しください。" }] });
+    } catch(e) {}
   }
 }
 
@@ -252,4 +258,7 @@ async function streamToBuffer(stream) {
   });
 }
 
-app.listen(PORT, "0.0.0.0");
+// --- サーバー起動 ---
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server is running on port ${PORT}`);
+});
