@@ -13,36 +13,42 @@ if (!admin.apps.length) {
 const db = admin.firestore();
 db.settings({ ignoreUndefinedProperties: true });
 
-// --- 2. クライアント初期化 ---
+// --- 2. 各種クライアント初期化 ---
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const client = new line.messagingApi.MessagingApiClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 const blobClient = new line.messagingApi.MessagingApiBlobClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 
-// --- 3. modeAI 専用プロンプト（データ受取最優先・即時反映ロジック） ---
+// --- 3. modeAI 専用プロンプト（超具体的アドバイス仕様） ---
 const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」です。
-トレーナー・栄養士の専門知識を「深いメンタルケア」で包み込むプロのアドバイザーです。
+大人のための洗練されたアドバイザーとして、理論（トレーナー・栄養士）と激励を高い次元で融合させてください。
 
-【最優先：データ受取と保存のロジック】
-1. ユーザーから「身長・体重・年齢・体脂肪率・目標」などの数値がメッセージ（userContent）に含まれている場合、**他のどのルールよりも優先してその数値を読み取り、回答の末尾に必ず [SAVE_PROFILE] タグを付与して保存してください。**
-2. データを送ってくれた瞬間、拒否することなく「データをありがとうございます。内容を把握しました」と伝え、そのままプロとしての具体的な分析や激励を開始してください。
-3. 過去のデータ（JSON）が空であっても、今回のメッセージでデータが提供されていれば、それは「データがある状態」として扱います。
-4. 全くデータがなく、かつ今回も提示されていない場合のみ、具体的な助言を控え、データを要求してください。
+【最重要：初回データ提示時への対応】
+ユーザーから身長・体重・体脂肪率・目標が提示されたら、挨拶もそこそこに、以下の**具体的数値プラン**を即座に提示してください。
 
-【食事解析のフォーマット】
-画像解析時は、必ず冒頭に以下を数値で出力：
+1. 【推定消費カロリー】
+   ユーザーの体格から基礎代謝と1日の消費カロリーを算出し、提示。
+2. 【目標摂取カロリーとPFC設定】
+   目標達成のために、1日あたり「何kcal」に抑えるべきか。
+   その内訳（P:タンパク質、F:脂質、C:炭水化物）をそれぞれ「g（グラム）」で指定。
+3. 【トレーニング処方箋】
+   「頑張りましょう」は禁止。具体的な種目名、セット数、回数、頻度を提示してください。
+   （例：スクワット20回×3セットを週3回、早歩き30分など）
+
+【画像解析時のフォーマット（厳守）】
 カロリー：〇〇kcal
 タンパク質：〇〇g
 脂質：〇〇g
 炭水化物：〇〇g
 （上記は画像からの推定です）
 
-【プロフィール管理タグ（絶対必須）】
-数値を検知・更新した際は必ず末尾に付与（1つでも数値があれば付与）：
-[SAVE_PROFILE: {"weight": 数値, "height": 数値, "fatPercentage": 数値, "age": 数値, "targetWeight": 数値, "goal": "文字列"}]
+【人格とスタンス】
+・「数字は嘘をつきません」というプロの厳しさと、「私はあなたの味方です」という大人の包容力を共存させてください。
+・回答は常に構造化（見出しを活用）し、スマホで一読して「何をすべきか」がわかるようにしてください。
 
-【口調】
-洗練された敬語。大人の余裕と、目標達成への強い並走感。`;
+【プロフィール管理タグ】
+[SAVE_PROFILE: {"weight": 数値, "height": 数値, "fatPercentage": 数値, "age": 数値, "targetWeight": 数値, "goal": "文字列"}]`;
 
+// 重複防止
 const eventCache = new Set();
 
 app.post("/webhook", line.middleware({ 
@@ -76,7 +82,7 @@ async function handleModeAI(event) {
     const buffer = await streamToBuffer(blob);
     const base64Image = buffer.toString("base64");
     userContent = [
-      { type: "text", text: "この料理の栄養素を分析し、指定のフォーマットで数値を出力してください。" },
+      { type: "text", text: "この料理を分析し、カロリーとPFCを数値で出して。その上で私の身体データに基づいた助言を。" },
       { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
     ];
   } else {
@@ -96,32 +102,28 @@ async function handleModeAI(event) {
     }
   } catch (e) { console.error("DB Error:", e); }
 
-  // OpenAI 呼び出し（指示の優先順位を明確化）
+  // OpenAI 呼び出し（ロジカルな回答を引き出す設定）
   const completion = await openai.chat.completions.create({
     model: "gpt-4o",
     messages: [
-      { role: "system", content: SYSTEM_PROMPT + "\n\n【DBに登録済みのユーザーデータ】" + JSON.stringify(profileData) },
+      { role: "system", content: SYSTEM_PROMPT + "\n\n【登録データ】" + JSON.stringify(profileData) },
       ...pastMessages,
       { role: "user", content: userContent }
     ],
-    temperature: 0.2
+    temperature: 0.3 // 数値の正確性を重視
   });
 
   let aiResponse = completion.choices[0].message.content || "";
 
-  // [SAVE_PROFILE] タグの処理とFirestore保存
+  // プロフィール保存
   const saveMatch = aiResponse.match(/\[SAVE_PROFILE: ({.*?})\]/);
   if (saveMatch) {
     try {
       const newData = JSON.parse(saveMatch[1]);
-      // nullやundefinedを除外してクリーンなデータにする
       const cleanData = Object.fromEntries(Object.entries(newData).filter(([_, v]) => v != null));
       await db.collection("users").doc(userId).set(cleanData, { merge: true });
       aiResponse = aiResponse.replace(/\[SAVE_PROFILE: {.*?}\]/g, "").trim();
-      console.log(`[SUCCESS] Profile updated for user: ${userId}`);
-    } catch (e) {
-      console.error("Save Match Error:", e);
-    }
+    } catch (e) {}
   }
 
   await client.pushMessage({ to: userId, messages: [{ type: "text", text: aiResponse }] });
