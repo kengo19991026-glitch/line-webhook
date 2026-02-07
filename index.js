@@ -18,32 +18,36 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const client = new line.messagingApi.MessagingApiClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 const blobClient = new line.messagingApi.MessagingApiBlobClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 
-// --- 3. modeAI 専用プロンプト（数値化の強制と人格の統合） ---
+// --- 3. modeAI 専用プロンプト（フォーマット強制版） ---
 const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」です。
-大人のための洗練されたアドバイザーとして、トレーナー・栄養士の専門知識を「深いメンタルケア」で包み込んで提供してください。
 
-【食事画像解析の絶対ルール】
-画像が送られてきた場合、必ず冒頭に以下の「推定数値データ」を構造化して提示してください。
-1. 料理名
-2. 推定総カロリー (kcal)
-3. PFCバランスの推定値 (P:タンパク質, F:脂質, C:炭水化物) を「g（グラム）」で。
+【画像が送られてきた場合の絶対ルール】
+あなたは「栄養成分分析システム」として機能します。
+「美味しそうですね」などの感想や挨拶から始めず、**必ず以下のフォーマット通りに数値を出力してください。**
 
-回答の開始例：
-「お疲れ様です。お食事の写真を拝見しました。分析結果をご報告しますね。
-■分析データ
-・料理：〇〇
-・熱量：約000kcal
-・PFC：P:00g / F:00g / C:00g」
+出力フォーマット：
+-----------------------------------
+【分析結果】
+料理名：〇〇
+カロリー：〇〇kcal
+タンパク質：〇〇g
+脂質：〇〇g
+炭水化物：〇〇g
+（上記は画像からの推定です）
 
-【人格とスタンス】
-・カウンセラーモードは廃止しましたが、すべての回答に「激励と共感」を込めてください。
-・数値はプロとして正確に出しつつ、その後のアドバイスでは「この一食があなたの明日の力になります」といった、大人の余裕と優しさを持って接してください。
-・否定はせず、改善点を伝える際も「こうするとさらに効率的です」とポジティブに導いてください。
+【アドバイス】
+（ここからトレーナー・栄養士として、メンタルケアを含めた温かいアドバイスや、次回の食事への提案を記述してください）
+-----------------------------------
+
+【テキスト会話時のルール】
+通常時は、トレーナー・栄養士・カウンセラーを統合した、大人な雰囲気の洗練されたアドバイザーとして、ユーザーに寄り添った対話をしてください。
 
 【プロフィール管理】
+会話から新しい身体データ（体重、体脂肪率など）を得た場合のみ、回答の最後に以下を付与：
 [SAVE_PROFILE: {"weight": 数値, "height": 数値, "fatPercentage": 数値, "targetWeight": 数値, "goal": "文字列"}]
-の形式を末尾に付与して、ユーザーデータを更新してください。`;
+`;
 
+// 重複防止キャッシュ
 const eventCache = new Set();
 
 app.post("/webhook", line.middleware({ 
@@ -70,15 +74,17 @@ async function handleModeAI(event) {
   const userId = event.source.userId;
   let userContent;
 
-  // メッセージ判別（テキストか画像か）
+  // メッセージ判別
   if (event.type === "message" && event.message.type === "text") {
     userContent = [{ type: "text", text: event.message.text }];
   } else if (event.type === "message" && event.message.type === "image") {
     const blob = await blobClient.getMessageContent(event.message.id);
     const buffer = await streamToBuffer(blob);
     const base64Image = buffer.toString("base64");
+    
+    // 画像送信時のプロンプトも「数値を出すこと」にフォーカスさせる
     userContent = [
-      { type: "text", text: "この写真を分析し、カロリーとPFCバランスを数値で教えてください。その上で私に寄り添ったアドバイスを。" },
+      { type: "text", text: "この料理の栄養素を分析し、指定されたフォーマット（カロリー、PFC）で数値を出力してください。" },
       { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
     ];
   } else {
@@ -91,22 +97,25 @@ async function handleModeAI(event) {
   try {
     const profileDoc = await db.collection("users").doc(userId).get();
     if (profileDoc.exists) profileData = profileDoc.data();
+    
+    // 画像解析の際は、過去の文脈に引っ張られすぎないよう履歴を少し減らすか、あるいはそのまま使う
     const snap = await db.collection("users").doc(userId).collection("history").orderBy("createdAt", "desc").limit(6).get();
     if (!snap.empty) {
       pastMessages = snap.docs.reverse().map(doc => ({ role: doc.data().role, content: doc.data().content }));
     }
   } catch (e) { console.error("DB Error:", e); }
 
-  // OpenAI 呼び出し（数値の安定性を高める設定）
+  // OpenAI 呼び出し
   const completion = await openai.chat.completions.create({
     model: "gpt-4o",
     messages: [
-      { role: "system", content: SYSTEM_PROMPT + "\n【現状】" + JSON.stringify(profileData) },
+      { role: "system", content: SYSTEM_PROMPT + "\n【ユーザー情報】" + JSON.stringify(profileData) },
       ...pastMessages,
       { role: "user", content: userContent }
     ],
-    temperature: 0.3, // 数値の推測をより堅実にするため低めに設定
-    max_tokens: 1000
+    // Temperatureを下げて、フォーマット遵守率を高める
+    temperature: 0.2, 
+    max_tokens: 800
   });
 
   let aiResponse = completion.choices[0].message.content || "";
@@ -124,7 +133,7 @@ async function handleModeAI(event) {
   await client.pushMessage({ to: userId, messages: [{ type: "text", text: aiResponse }] });
 
   // 履歴保存
-  const historyText = event.message.type === "text" ? event.message.text : "[食事画像を送信]";
+  const historyText = event.message.type === "text" ? event.message.text : "[画像送信]";
   db.collection("users").doc(userId).collection("history").add({
     role: "user", content: historyText, createdAt: admin.firestore.FieldValue.serverTimestamp()
   }).catch(() => {});
