@@ -1,9 +1,14 @@
 import express from "express";
 import * as line from "@line/bot-sdk";
 import OpenAI from "openai";
+import admin from "firebase-admin";
 
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
+
+// --- Firestoreの初期化（Cloud RunのIAM権限を利用） ---
+admin.initializeApp();
+const db = admin.firestore();
 
 app.get("/", (_req, res) => res.status(200).send("ok"));
 
@@ -13,19 +18,20 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// --- プロンプトをトレーナー・栄養士・カウンセラー用に刷新 ---
+// --- 強化された専門家プロンプト ---
 const SYSTEM_PROMPT = [
-  "あなたは、以下の3つの専門性を持つ『究極のパーソナル・ヘルスケア・アドバイザー』です。",
+  "あなたは、超一流パーソナルトレーナー、管理栄養士、心理カウンセラーの3つの専門知識を統合した、ユーザーに一生寄り添う『究極のアドバイザー』です。",
   "",
-  "1. 【超一流パーソナルトレーナー】: 運動に対し、解剖学に基づいた具体的な改善点や効かせ方を指導します。",
-  "2. 【専門管理栄養士】: 食事に対し、PFCバランスや栄養素の観点から具体的で実践的なアドバイスをします。",
-  "3. 【共感型カウンセラー】: ユーザーの悩みや疲れに寄り添い、心理学的にモチベーションを支えます。",
+  "【各専門家としての振る舞い】",
+  "1. トレーナー: 具体的数値（セット数、RPE、可動域の注意点）に基づいた分析を行います。単に「頑張りましたね」ではなく、「その重量なら次はこれを目指しましょう」「その種目ならここを意識するとより効きます」と技術的指導を行ってください。",
+  "2. 栄養士: 食事内容からPFCバランスを推測し、不足している栄養素（ビタミン、ミネラル含む）や、次に摂取すべき食材を具体的に提示してください。",
+  "3. カウンセラー: ユーザーの言葉の裏にある「疲れ」や「焦り」を察知し、受容した上で、明日また一歩踏み出したくなるような力強い励ましを送ってください。",
   "",
-  "【回答ルール】",
-  "・常に「私たちはチームです」という温かい姿勢で接してください。",
-  "・LINEで読みやすいよう、適宜改行や絵文字、箇条書きを使ってください。",
-  "・ユーザーの入力が「食事」「運動」「悩み」のどれに該当するか判断し、最適な専門家として回答してください（複数が混ざってもOK）。",
-  "・1回の返信は、スマホ画面で読みきれる程度の長さにまとめてください。"
+  "【回答の指針】",
+  "・過去の会話履歴を把握していることを示してください（例：「前回言っていた〇〇ですが…」）。",
+  "・曖昧な助言を避け、今日から実践できる『最初の一歩』を具体的に提案してください。",
+  "・LINE特有の読みやすさを重視し、重要なポイントは太字や絵文字で強調してください。",
+  "・「私たちは最高のチーム」という信頼感を醸成する口調を維持してください。"
 ].join("\n");
 
 if (!LINE_TOKEN || !LINE_SECRET) {
@@ -43,33 +49,61 @@ if (!LINE_TOKEN || !LINE_SECRET) {
       if (event.type !== "message" || event.message?.type !== "text") return;
       if (!event.replyToken) return;
 
+      const userId = event.source.userId;
       const userText = (event.message.text || "").trim();
 
       try {
-        // OpenAI Chat Completion API (v4系の標準的な書き方に修正)
+        // 1. Firestoreから直近の会話履歴（最大6件）を取得
+        const historyRef = db.collection("users").doc(userId).collection("history")
+          .orderBy("createdAt", "desc")
+          .limit(6);
+        const snapshot = await historyRef.get();
+        let pastMessages = [];
+        snapshot.forEach(doc => {
+          const data = doc.data();
+          pastMessages.unshift({ role: data.role, content: data.content });
+        });
+
+        // 2. OpenAI API呼び出し（履歴を含めて送信）
         const completion = await openai.chat.completions.create({
-          model: "gpt-4o", // より高精度な回答のためにgpt-4oを推奨（gpt-4o-miniでも可）
+          model: "gpt-4o",
           messages: [
             { role: "system", content: SYSTEM_PROMPT },
+            ...pastMessages,
             { role: "user", content: userText }
           ],
         });
 
-        const aiText = completion.choices[0].message.content || "申し訳ありません。回答を生成できませんでした。";
+        const aiText = completion.choices[0].message.content || "申し訳ありません。アドバイスを生成できませんでした。";
 
+        // 3. 今回の会話（ユーザーとAI両方）を保存
+        const batch = db.batch();
+        const userLogRef = db.collection("users").doc(userId).collection("history").doc();
+        const aiLogRef = db.collection("users").doc(userId).collection("history").doc();
+
+        batch.set(userLogRef, { 
+          role: "user", 
+          content: userText, 
+          createdAt: admin.firestore.FieldValue.serverTimestamp() 
+        });
+        batch.set(aiLogRef, { 
+          role: "assistant", 
+          content: aiText, 
+          createdAt: admin.firestore.FieldValue.serverTimestamp() 
+        });
+        await batch.commit();
+
+        // 4. LINEに返信
         await client.replyMessage({
           replyToken: event.replyToken,
           messages: [{ type: "text", text: aiText }],
         });
-      } catch (err) {
-        console.error("OpenAI error:", err);
 
+      } catch (err) {
+        console.error("Error:", err);
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{
-            type: "text",
-            text: "通信エラーが発生しました。少し時間をおいてから再度話しかけてくださいね！",
-          }],
+          messages: [{ type: "text", text: "少し通信が不安定なようです。もう一度送っていただけますか？" }],
         });
       }
     }));
