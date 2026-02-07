@@ -3,22 +3,23 @@ import * as line from "@line/bot-sdk";
 import OpenAI from "openai";
 import admin from "firebase-admin";
 
+// --- 1. アプリ設定 ---
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
 
-// --- 1. Firestore 初期化 ---
+// --- 2. Firebase 初期化 ---
 if (!admin.apps.length) {
   admin.initializeApp({ projectId: "project-d3eb52a5-cef2-40c7-bfc" });
 }
 const db = admin.firestore();
 db.settings({ ignoreUndefinedProperties: true });
 
-// --- 2. クライアント初期化 ---
+// --- 3. クライアント初期化 ---
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const client = new line.messagingApi.MessagingApiClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 const blobClient = new line.messagingApi.MessagingApiBlobClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 
-// --- 3. modeAI 専用プロンプト ---
+// --- 4. プロンプト設定 ---
 const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」です。
 あなたは**「どんな画像でも即座に栄養価を算出する世界最高峰のAI」**です。
 
@@ -59,29 +60,28 @@ const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」で
 // 重複防止キャッシュ
 const eventCache = new Set();
 
-// --- ヘルスチェック用エンドポイント（Cloud Runの生存確認用） ---
+// --- ヘルスチェック（TCP Probe対策） ---
 app.get("/", (req, res) => {
-  res.status(200).send("modeAI is running!");
+  res.status(200).send("OK");
 });
 
 app.post("/webhook", line.middleware({ 
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN, 
   channelSecret: process.env.LINE_CHANNEL_SECRET 
 }), (req, res) => {
-  // LINEサーバーへ即座に200を返す（タイムアウト防止）
-  res.status(200).send("OK");
+  res.status(200).send("OK"); // 即座に200を返し、タイムアウトを防ぐ
   
   const events = req.body.events || [];
-
   events.forEach(async (event) => {
     if (eventCache.has(event.eventId)) return;
     eventCache.add(event.eventId);
+    // 60秒後にキャッシュ削除
     setTimeout(() => eventCache.delete(event.eventId), 60000);
 
     try {
       await handleModeAI(event);
     } catch (err) {
-      console.error("Event Processing Error:", err);
+      console.error("Event Handling Error:", err);
     }
   });
 });
@@ -96,13 +96,13 @@ async function handleModeAI(event) {
     if (event.type === "message" && event.message.type === "text") {
       userContent = [{ type: "text", text: event.message.text }];
     } else if (event.type === "message" && event.message.type === "image") {
-      // ★ 即時レスポンス：不安解消のため先にメッセージを送る
+      // 解析中メッセージ
       try {
         await client.pushMessage({
           to: userId,
           messages: [{ type: "text", text: "画像を解析しています...少々お待ちください🍳" }]
         });
-      } catch (e) { console.error("Push Error:", e); }
+      } catch (e) { console.error("Push Error (Ignoring):", e); }
 
       const blob = await blobClient.getMessageContent(event.message.id);
       const buffer = await streamToBuffer(blob);
@@ -122,17 +122,17 @@ async function handleModeAI(event) {
     let summary = { today: { k: 0, p: 0, f: 0, c: 0 }, week: { k: 0 }, month: { k: 0 } };
 
     try {
-      // プロフィール取得
+      // 1. プロフィール取得
       const profileDoc = await db.collection("users").doc(userId).get();
       if (profileDoc.exists) profileData = profileDoc.data();
 
-      // 履歴取得
+      // 2. 履歴取得
       const snap = await db.collection("users").doc(userId).collection("history").orderBy("createdAt", "desc").limit(4).get();
       if (!snap.empty) {
         pastMessages = snap.docs.reverse().map(doc => ({ role: doc.data().role, content: doc.data().content }));
       }
 
-      // ログ集計
+      // 3. ログ集計（ここがクラッシュポイントだったため強化ガード）
       const now = new Date();
       const jstOffset = 9 * 60 * 60 * 1000;
       const jstNow = new Date(now.getTime() + jstOffset);
@@ -147,7 +147,16 @@ async function handleModeAI(event) {
       if (!logSnap.empty) {
         logSnap.forEach(doc => {
           const d = doc.data();
-          const logDateJst = new Date(d.createdAt.toDate().getTime() + jstOffset);
+          // ★日付ガード：createdAtが無い、またはtoDateできないデータはスキップして進む
+          let logDateJst;
+          try {
+            if (d.createdAt && typeof d.createdAt.toDate === 'function') {
+                logDateJst = new Date(d.createdAt.toDate().getTime() + jstOffset);
+            } else {
+                return; // 不正なデータは無視
+            }
+          } catch (err) { return; }
+
           const vals = { k: Number(d.kcal)||0, p: Number(d.p)||0, f: Number(d.f)||0, c: Number(d.c)||0 };
           
           summary.month.k += vals.k;
@@ -158,7 +167,7 @@ async function handleModeAI(event) {
         });
       }
     } catch (e) { 
-      console.log("DB Read Error (Safe to ignore):", e); 
+      console.log("DB Read Error (Recovered):", e); 
     }
 
     const getAvg = (sum, days) => Math.round(sum / days);
@@ -220,19 +229,21 @@ ${JSON.stringify(profileData)}
 
     // 履歴保存
     const historyText = event.message.type === "text" ? event.message.text : "[画像送信]";
+    // エラーが出ても会話を止めないよう catch する
     try {
-      await db.collection("users").doc(userId).collection("history").add({
-        role: "user", content: historyText, createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-      await db.collection("users").doc(userId).collection("history").add({
-        role: "assistant", content: aiResponse, createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-    } catch(e) { console.error("History Save Error", e); }
+        await db.collection("users").doc(userId).collection("history").add({
+            role: "user", content: historyText, createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        await db.collection("users").doc(userId).collection("history").add({
+            role: "assistant", content: aiResponse, createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+    } catch(e) {}
 
   } catch (error) {
-    console.error("Critical Error in handleModeAI:", error);
+    console.error("Critical Error:", error);
+    // ユーザーへの最終通知
     try {
-        await client.pushMessage({ to: userId, messages: [{ type: "text", text: "エラーが発生しました。もう一度お試しください。" }] });
+        await client.pushMessage({ to: userId, messages: [{ type: "text", text: "エラーが発生しましたが、復旧しました。もう一度内容を送ってください。" }] });
     } catch(e) {}
   }
 }
