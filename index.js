@@ -18,7 +18,7 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const client = new line.messagingApi.MessagingApiClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 const blobClient = new line.messagingApi.MessagingApiBlobClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 
-// --- 3. modeAI 専用プロンプト（ログ保存機能追加） ---
+// --- 3. modeAI 専用プロンプト（ログ保存・強制強化版） ---
 const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」です。
 「数字は嘘をつかない」を信条とする、超ロジカルかつユーザーに寄り添うパーソナルトレーナー兼栄養士です。
 
@@ -27,16 +27,16 @@ const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」で
 2. 箇条書きには「・」を使用してください。
 3. **Markdown記法（#や*）は禁止**です。絶対に使わないでください。
 
-【思考プロセス】
-回答前に必ずユーザーデータ（身長・体重・年齢・体脂肪率）から以下を計算してください。
-1. BMR（基礎代謝）
-2. TDEE（総消費カロリー）
-3. 目標達成のためのPFCバランス
+【最重要タスク：食事データの保存】
+ユーザーが「食事の写真」や「食べたものの報告」を送ってきた場合、アドバイスの最後に**必ず**以下の形式で隠しタグを出力してください。
+これがないとデータベースに記録されません。
 
-【食事データの記録（重要）】
-ユーザーから食事の報告（画像またはテキスト）があった場合、その食事の「推定カロリー」と「PFC」を抽出し、回答の末尾に以下のタグを出力してデータベースに保存してください。
+出力タグ形式：
 [SAVE_NUTRITION: {"food": "料理名", "kcal": 数値, "p": 数値, "f": 数値, "c": 数値}]
-※数値は概算で構いません（単位なしの数字のみ）。
+
+※注意点：
+・数値には「kcal」や「g」などの単位をつけず、純粋な数字だけにしてください。（例: "kcal": 550）
+・前後に余計な文字を入れないでください。
 
 【回答構成】
 挨拶は手短にし、すぐに以下の形式で数値を出してください。
@@ -46,13 +46,16 @@ const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」で
 ・目標摂取：約〇〇kcal
 ・目標PFC：P:〇〇g / F:〇〇g / C:〇〇g
 
-■具体的なアクション
-（ここから、数値に基づいた食事やトレーニングの具体的種目・回数を「・」を使って箇条書きで提示）
+■分析結果（食事の場合）
+・料理名：〇〇
+・カロリー：〇〇kcal
+・PFC：P:〇〇g / F:〇〇g / C:〇〇g
 
 ■アドバイス
 （メンタルケアを含めた、プロとしての温かい一言）
 
 【プロフィール管理タグ】
+ユーザーの身体データが更新された場合のみ付与：
 [SAVE_PROFILE: {"weight": 数値, "height": 数値, "fatPercentage": 数値, "age": 数値, "targetWeight": 数値, "goal": "文字列"}]`;
 
 // 重複防止キャッシュ
@@ -89,8 +92,9 @@ async function handleModeAI(event) {
     const buffer = await streamToBuffer(blob);
     const base64Image = buffer.toString("base64");
     
+    // 画像送信時、ログ保存タグを出すよう強く指示
     userContent = [
-      { type: "text", text: "この写真を栄養士として分析してください。Markdown記法は使わず、■や・を使って見やすく数値を提示してください。また、栄養データ保存用のタグも忘れずに出力してください。" },
+      { type: "text", text: "この写真を栄養士として分析してください。Markdown記法は禁止です。また、分析結果のカロリーとPFCをデータベースに保存するため、必ず末尾に [SAVE_NUTRITION] タグを正しいJSON形式で出力してください。" },
       { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
     ];
   } else {
@@ -123,29 +127,39 @@ async function handleModeAI(event) {
 
   let aiResponse = completion.choices[0].message.content || "";
 
-  // --- 1. プロフィール保存処理 ---
-  const saveProfileMatch = aiResponse.match(/\[SAVE_PROFILE: ({.*?})\]/);
+  // --- 1. 食事ログ保存処理（正規表現を強化） ---
+  // 改行が含まれていてもマッチするように [\s\S]*? を使用
+  const saveNutritionMatch = aiResponse.match(/\[SAVE_NUTRITION: (\{[\s\S]*?\})\]/);
+  if (saveNutritionMatch) {
+    try {
+      const jsonStr = saveNutritionMatch[1];
+      const nutritionData = JSON.parse(jsonStr);
+      
+      // 数値型への変換（AIが文字列で返した場合の保険）
+      const safeData = {
+        food: nutritionData.food || "不明な食事",
+        kcal: Number(nutritionData.kcal) || 0,
+        p: Number(nutritionData.p) || 0,
+        f: Number(nutritionData.f) || 0,
+        c: Number(nutritionData.c) || 0,
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      };
+
+      await db.collection("users").doc(userId).collection("nutrition_logs").add(safeData);
+      console.log(`[SUCCESS] Nutrition log saved for user: ${userId}`);
+    } catch (e) {
+      console.error("[ERROR] Nutrition JSON parse failed:", e);
+      // ここでエラーが出てもユーザーへの返信は止めない
+    }
+  }
+
+  // --- 2. プロフィール保存処理 ---
+  const saveProfileMatch = aiResponse.match(/\[SAVE_PROFILE: (\{[\s\S]*?\})\]/);
   if (saveProfileMatch) {
     try {
       const newData = JSON.parse(saveProfileMatch[1]);
       await db.collection("users").doc(userId).set(newData, { merge: true });
     } catch (e) {}
-  }
-
-  // --- 2. 食事ログ保存処理（新規追加） ---
-  const saveNutritionMatch = aiResponse.match(/\[SAVE_NUTRITION: ({.*?})\]/);
-  if (saveNutritionMatch) {
-    try {
-      const nutritionData = JSON.parse(saveNutritionMatch[1]);
-      // 日時情報(createdAt)を付与して nutrition_logs コレクションに保存
-      await db.collection("users").doc(userId).collection("nutrition_logs").add({
-        ...nutritionData,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-      console.log(`[LOG] Nutrition saved for user: ${userId}`);
-    } catch (e) {
-      console.error("[ERROR] Nutrition save failed:", e);
-    }
   }
 
   // --- クリーニング処理 ---
@@ -167,9 +181,9 @@ async function handleModeAI(event) {
 function cleanMarkdown(text) {
   let cleaned = text;
   
-  // 保存用タグをユーザーに見せないように削除
-  cleaned = cleaned.replace(/\[SAVE_PROFILE: {.*?}\]/g, "");
-  cleaned = cleaned.replace(/\[SAVE_NUTRITION: {.*?}\]/g, "");
+  // 保存用タグを削除（改行対応）
+  cleaned = cleaned.replace(/\[SAVE_PROFILE: \{[\s\S]*?\}\]/g, "");
+  cleaned = cleaned.replace(/\[SAVE_NUTRITION: \{[\s\S]*?\}\]/g, "");
 
   // マークダウン記号の削除・置換
   cleaned = cleaned.replace(/\*\*(.*?)\*\*/g, "$1"); // 太字
