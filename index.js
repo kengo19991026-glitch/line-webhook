@@ -18,33 +18,31 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const client = new line.messagingApi.MessagingApiClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 const blobClient = new line.messagingApi.MessagingApiBlobClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 
-// --- 3. modeAI 専用プロンプト（フォーマット強制版） ---
+// --- 3. modeAI 専用プロンプト（データ強制ガード機能付き） ---
 const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」です。
 
-【画像が送られてきた場合の絶対ルール】
-あなたは「栄養成分分析システム」として機能します。
-「美味しそうですね」などの感想や挨拶から始めず、**必ず以下のフォーマット通りに数値を出力してください。**
+【最重要ルール：データがない場合の対応】
+提供されたユーザー情報（JSON）を確認し、「weight（体重）」や「goal（目標）」が空、または未定義の場合、**具体的なアドバイスを一切拒否してください。**
+その代わり、以下の定型文のみを返してデータを要求してください。
 
-出力フォーマット：
------------------------------------
-【分析結果】
-料理名：〇〇
-カロリー：〇〇kcal
-タンパク質：〇〇g
-脂質：〇〇g
-炭水化物：〇〇g
-（上記は画像からの推定です）
+「プロとして的確なアドバイスをするために、まずはあなたの現状を教えていただけますか？
+・身長
+・体重
+・年齢
+・体脂肪率
+・目標
+を教えてください。このデータをもとに、あなた専用のプランを構築します。」
 
-【アドバイス】
-（ここからトレーナー・栄養士として、メンタルケアを含めた温かいアドバイスや、次回の食事への提案を記述してください）
------------------------------------
+※データが揃うまでは、食事解析やトレーニング指導を行わないでください（ハルシネーション防止のため）。
 
-【テキスト会話時のルール】
-通常時は、トレーナー・栄養士・カウンセラーを統合した、大人な雰囲気の洗練されたアドバイザーとして、ユーザーに寄り添った対話をしてください。
+【データが揃っている場合の振る舞い】
+・画像解析：必ず冒頭に【分析結果】として「料理名・カロリー・PFC」を数値リストで出力。
+・通常会話：トレーナー・栄養士の視点に、大人のメンタルケア（激励と共感）を込めて回答。
+・口調：洗練された敬語。絵文字は控えめに、知的な印象を与えること。
 
 【プロフィール管理】
-会話から新しい身体データ（体重、体脂肪率など）を得た場合のみ、回答の最後に以下を付与：
-[SAVE_PROFILE: {"weight": 数値, "height": 数値, "fatPercentage": 数値, "targetWeight": 数値, "goal": "文字列"}]
+会話から新しい身体データ（体重、体脂肪率、年齢など）を得た場合のみ、回答の最後に以下を付与：
+[SAVE_PROFILE: {"weight": 数値, "height": 数値, "fatPercentage": 数値, "age": 数値, "targetWeight": 数値, "goal": "文字列"}]
 `;
 
 // 重複防止キャッシュ
@@ -82,7 +80,6 @@ async function handleModeAI(event) {
     const buffer = await streamToBuffer(blob);
     const base64Image = buffer.toString("base64");
     
-    // 画像送信時のプロンプトも「数値を出すこと」にフォーカスさせる
     userContent = [
       { type: "text", text: "この料理の栄養素を分析し、指定されたフォーマット（カロリー、PFC）で数値を出力してください。" },
       { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
@@ -96,9 +93,13 @@ async function handleModeAI(event) {
   let pastMessages = [];
   try {
     const profileDoc = await db.collection("users").doc(userId).get();
-    if (profileDoc.exists) profileData = profileDoc.data();
+    if (profileDoc.exists) {
+        profileData = profileDoc.data();
+    } else {
+        // 新規ユーザーでデータがない場合、空であることを明示
+        profileData = { weight: null, goal: null }; 
+    }
     
-    // 画像解析の際は、過去の文脈に引っ張られすぎないよう履歴を少し減らすか、あるいはそのまま使う
     const snap = await db.collection("users").doc(userId).collection("history").orderBy("createdAt", "desc").limit(6).get();
     if (!snap.empty) {
       pastMessages = snap.docs.reverse().map(doc => ({ role: doc.data().role, content: doc.data().content }));
@@ -109,11 +110,10 @@ async function handleModeAI(event) {
   const completion = await openai.chat.completions.create({
     model: "gpt-4o",
     messages: [
-      { role: "system", content: SYSTEM_PROMPT + "\n【ユーザー情報】" + JSON.stringify(profileData) },
+      { role: "system", content: SYSTEM_PROMPT + "\n【ユーザー情報(必須)】" + JSON.stringify(profileData) },
       ...pastMessages,
       { role: "user", content: userContent }
     ],
-    // Temperatureを下げて、フォーマット遵守率を高める
     temperature: 0.2, 
     max_tokens: 800
   });
