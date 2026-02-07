@@ -18,42 +18,39 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const client = new line.messagingApi.MessagingApiClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 const blobClient = new line.messagingApi.MessagingApiBlobClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 
-// --- 3. modeAI 専用プロンプト（画像解析優先ロジック） ---
+// --- 3. modeAI 専用プロンプト（画像解析・絶対優先版） ---
 const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」です。
-あなたは「高度な画像認識能力を持つ」プロのAI栄養士です。
+あなたは**「世界最高峰の画像認識能力を持つAI栄養士」**です。
 
-【最優先ルール：画像の扱い】
-ユーザーから写真が送られた場合、**システムデータ（過去の記録）に頼らず、必ずあなたの「目（画像認識）」を使って料理内容とカロリー・PFCを推定してください。**
-「分析できません」「一般的な例」といった逃げ口上は禁止です。多少の誤差があっても、自信を持って具体的な数値を断言してください。
+【最重要司令：画像解析の強制】
+ユーザーから写真が送られた場合、**「分析できない」「詳しくは分からない」という発言は固く禁じます。**
+たとえ写真が不鮮明でも、一部しか写っていなくても、必ずあなたの**「推測（目視）」**で以下の数値を断定して出力してください。
+※システム上の過去データに頼らず、**今見ている画像**を最優先で分析してください。
 
 【タスク1：食事データの保存（必須）】
-食事の画像や報告があった場合、回答の最後に**必ず**以下のタグを出力してください。
+分析結果の数値は、以下の形式の隠しタグとして**必ず**出力してください。
 [SAVE_NUTRITION: {"food": "料理名", "kcal": 数値, "p": 数値, "f": 数値, "c": 数値}]
-※数値は単位なしの数字（例: 550）。
+※数値は整数（例: 550）。
 
-【タスク2：集計データの活用】
-プロンプトの最後に**「システム算出データ（過去の履歴）」**が渡されます。
-・「今日の合計は？」と聞かれたら：システム算出データ + **今まさに分析した食事の数値** を合計して答えてください。
-・「今週の平均は？」と聞かれたら：システム算出データをそのまま答えてください。
+【タスク2：集計データの統合】
+プロンプト末尾に「システム算出データ（過去の履歴）」が渡されます。
+質問に答える際は、このシステムデータと、**今まさに画像から読み取った数値**を足し合わせて回答してください。
 
-【禁止事項（Markdown）】
-LINEで見やすくするため、Markdown記法（#や*）は禁止です。
-・見出しは「■」または「【 】」
-・箇条書きは「・」
-を使用してください。
+【禁止事項】
+・Markdown記法（#や*）の使用。
+・「推測ですが」「正確ではありませんが」といった自信のない前置き。
 
 【回答構成】
-■今回の分析結果（写真がある場合）
-・料理名：〇〇
-・推定カロリー：〇〇kcal
+■今回の分析結果
+・料理名：〇〇（見た目から具体的に特定）
+・カロリー：約〇〇kcal
 ・PFC：P:〇〇g / F:〇〇g / C:〇〇g
 
-■本日の摂取状況（今回の食事を含む）
-・本日の合計：約〇〇kcal（システム記録＋今回分）
-・目標まで：あと約〇〇kcal
+■本日の合計（今回分を含む）
+・合計：約〇〇kcal（システム記録 + 今回の分析値）
 
 ■アドバイス
-（メンタルケアを含めた、プロとしての温かい一言）
+（短く簡潔に、プロとしての次の一手）
 
 【プロフィール管理タグ】
 [SAVE_PROFILE: {"weight": 数値, "height": 数値, "fatPercentage": 数値, "age": 数値, "targetWeight": 数値, "goal": "文字列"}]`;
@@ -92,9 +89,9 @@ async function handleModeAI(event) {
     const buffer = await streamToBuffer(blob);
     const base64Image = buffer.toString("base64");
     
-    // 画像送信時の指示を強化：「あなたは画像が見えている」と認識させる
+    // 画像送信時の指示を「推測許可」に変更
     userContent = [
-      { type: "text", text: "【重要指令】この写真を栄養士の目で見て、具体的に分析してください。「分析できない」という回答は許可しません。見たままの食材から数値を推定し、必ず末尾に [SAVE_NUTRITION] タグを出力してください。Markdown禁止。" },
+      { type: "text", text: "この料理の写真を分析してください。「分析できない」は禁止です。見た目から大胆に推測し、具体的なカロリーとPFCを数値で断定してください。必ず末尾に [SAVE_NUTRITION] タグを出力すること。" },
       { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
     ];
   } else {
@@ -104,13 +101,7 @@ async function handleModeAI(event) {
   // --- データ取得 & 集計ロジック ---
   let profileData = {};
   let pastMessages = [];
-  
-  // 集計用オブジェクト
-  let summary = {
-    today: { k: 0, p: 0, f: 0, c: 0 },
-    week:  { k: 0, p: 0, f: 0, c: 0 },
-    month: { k: 0, p: 0, f: 0, c: 0 }
-  };
+  let summary = { today: { k: 0, p: 0, f: 0, c: 0 }, week: { k: 0 }, month: { k: 0 } };
 
   try {
     const profileDoc = await db.collection("users").doc(userId).get();
@@ -121,11 +112,10 @@ async function handleModeAI(event) {
       pastMessages = snap.docs.reverse().map(doc => ({ role: doc.data().role, content: doc.data().content }));
     }
 
-    // 過去30日分のログ集計
+    // ログ集計
     const now = new Date();
     const jstOffset = 9 * 60 * 60 * 1000;
     const jstNow = new Date(now.getTime() + jstOffset);
-    
     const todayStart = new Date(jstNow); todayStart.setUTCHours(0, 0, 0, 0); 
     const weekStart = new Date(todayStart); weekStart.setDate(weekStart.getDate() - 6);
     const monthStart = new Date(todayStart); monthStart.setDate(monthStart.getDate() - 29);
@@ -134,52 +124,42 @@ async function handleModeAI(event) {
     let logSnap = { empty: true, forEach: () => {} };
     try {
       logSnap = await db.collection("users").doc(userId).collection("nutrition_logs")
-        .where("createdAt", ">=", queryStartUtc)
-        .get();
+        .where("createdAt", ">=", queryStartUtc).get();
     } catch (e) {}
 
     if (!logSnap.empty) {
       logSnap.forEach(doc => {
         const d = doc.data();
-        const logDateUtc = d.createdAt.toDate();
-        const logDateJst = new Date(logDateUtc.getTime() + jstOffset);
-
-        const vals = {
-          k: Number(d.kcal) || 0, p: Number(d.p) || 0, f: Number(d.f) || 0, c: Number(d.c) || 0
-        };
-        addValues(summary.month, vals);
-        if (logDateJst >= new Date(weekStart.getTime() - jstOffset)) addValues(summary.week, vals);
-        if (logDateJst >= new Date(todayStart.getTime() - jstOffset)) addValues(summary.today, vals);
+        const logDateJst = new Date(d.createdAt.toDate().getTime() + jstOffset);
+        const vals = { k: Number(d.kcal)||0, p: Number(d.p)||0, f: Number(d.f)||0, c: Number(d.c)||0 };
+        
+        summary.month.k += vals.k;
+        if (logDateJst >= new Date(weekStart.getTime() - jstOffset)) summary.week.k += vals.k;
+        if (logDateJst >= new Date(todayStart.getTime() - jstOffset)) {
+            summary.today.k += vals.k; summary.today.p += vals.p; summary.today.f += vals.f; summary.today.c += vals.c;
+        }
       });
     }
-
   } catch (e) { console.error("DB Error:", e); }
 
-  function addValues(target, vals) {
-    target.k += vals.k; target.p += vals.p; target.f += vals.f; target.c += vals.c;
-  }
   const getAvg = (sum, days) => Math.round(sum / days);
 
-  // システムメッセージ作成（画像の扱いを優先するよう指示）
+  // システムメッセージ作成（画像解析を邪魔しない文言に修正）
   const dynamicSystemMessage = `
 ${SYSTEM_PROMPT}
 
-【システム算出データ（過去〜直前までの記録）】
-※注意：以下は「過去のデータ」です。**今送られてきた画像の数値は含まれていません。**
-今送られてきた写真がある場合は、以下の数値に、あなたが解析した数値を**足して**回答してください。
+【システム算出データ（参考情報）】
+※以下は過去の記録です。**今送られてきた画像の分析には使用しないでください。**
+今、画像が送られている場合は、このデータに「画像から読み取った数値」を足して、今日の合計を回答してください。
 
-1. **本日** の合計 (記録済み分のみ)
-   - カロリー: ${summary.today.k} kcal
-   - P: ${summary.today.p}g / F: ${summary.today.f}g / C: ${summary.today.c}g
+・本日記録済み: ${summary.today.k} kcal
+・直近7日平均: ${getAvg(summary.week.k, 7)} kcal/日
 
-2. **直近7日間** (記録済み分のみ)
-   - 平均: ${getAvg(summary.week.k, 7)} kcal/日
-
-【最新ユーザーデータ】
+【ユーザー情報】
 ${JSON.stringify(profileData)}
 `;
 
-  // OpenAI 呼び出し (max_tokensを追加し、回答切れを防ぐ)
+  // OpenAI 呼び出し（画像解析の自由度を高めるためTemperatureを調整）
   const completion = await openai.chat.completions.create({
     model: "gpt-4o",
     messages: [
@@ -187,31 +167,25 @@ ${JSON.stringify(profileData)}
       ...pastMessages,
       { role: "user", content: userContent }
     ],
-    temperature: 0.3, // 少し自由度を戻して画像解析の柔軟性を上げる
+    temperature: 0.5, // 0.2だと保守的になりすぎて「分からない」と言うため、少し上げる
     max_tokens: 1000
   });
 
   let aiResponse = completion.choices[0].message.content || "";
 
-  // --- 保存処理 (食事ログ) ---
+  // --- 保存処理 ---
   const saveNutritionMatch = aiResponse.match(/\[SAVE_NUTRITION: (\{[\s\S]*?\})\]/);
   if (saveNutritionMatch) {
     try {
       const jsonStr = saveNutritionMatch[1];
       const nutritionData = JSON.parse(jsonStr);
-      const safeData = {
-        food: nutritionData.food || "不明な食事",
-        kcal: Number(nutritionData.kcal) || 0,
-        p: Number(nutritionData.p) || 0,
-        f: Number(nutritionData.f) || 0,
-        c: Number(nutritionData.c) || 0,
+      await db.collection("users").doc(userId).collection("nutrition_logs").add({
+        ...nutritionData,
         createdAt: admin.firestore.FieldValue.serverTimestamp()
-      };
-      await db.collection("users").doc(userId).collection("nutrition_logs").add(safeData);
-    } catch (e) { console.error("Nutrition Save Error:", e); }
+      });
+    } catch (e) {}
   }
 
-  // --- 保存処理 (プロフィール) ---
   const saveProfileMatch = aiResponse.match(/\[SAVE_PROFILE: (\{[\s\S]*?\})\]/);
   if (saveProfileMatch) {
     try {
