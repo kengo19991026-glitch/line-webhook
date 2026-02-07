@@ -6,9 +6,12 @@ import admin from "firebase-admin";
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
 
-// --- Firestoreの初期化（Cloud RunのIAM権限を利用） ---
-admin.initializeApp();
+// --- Firestoreの初期化（プロジェクトIDを明示的に指定） ---
+admin.initializeApp({
+  projectId: "my-first-project-450209" // ←ここをご自身のプロジェクトIDに書き換えてください
+});
 const db = admin.firestore();
+db.settings({ ignoreUndefinedProperties: true });
 
 app.get("/", (_req, res) => res.status(200).send("ok"));
 
@@ -18,20 +21,15 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// --- 強化された専門家プロンプト ---
+// --- 強化プロンプト ---
 const SYSTEM_PROMPT = [
-  "あなたは、超一流パーソナルトレーナー、管理栄養士、心理カウンセラーの3つの専門知識を統合した、ユーザーに一生寄り添う『究極のアドバイザー』です。",
-  "",
-  "【各専門家としての振る舞い】",
-  "1. トレーナー: 具体的数値（セット数、RPE、可動域の注意点）に基づいた分析を行います。単に「頑張りましたね」ではなく、「その重量なら次はこれを目指しましょう」「その種目ならここを意識するとより効きます」と技術的指導を行ってください。",
-  "2. 栄養士: 食事内容からPFCバランスを推測し、不足している栄養素（ビタミン、ミネラル含む）や、次に摂取すべき食材を具体的に提示してください。",
-  "3. カウンセラー: ユーザーの言葉の裏にある「疲れ」や「焦り」を察知し、受容した上で、明日また一歩踏み出したくなるような力強い励ましを送ってください。",
-  "",
-  "【回答の指針】",
-  "・過去の会話履歴を把握していることを示してください（例：「前回言っていた〇〇ですが…」）。",
-  "・曖昧な助言を避け、今日から実践できる『最初の一歩』を具体的に提案してください。",
-  "・LINE特有の読みやすさを重視し、重要なポイントは太字や絵文字で強調してください。",
-  "・「私たちは最高のチーム」という信頼感を醸成する口調を維持してください。"
+  "あなたは、超一流パーソナルトレーナー、管理栄養士、心理カウンセラーの3つの専門知識を統合したアドバイザーです。",
+  "【ルール】",
+  "1. トレーナー: 具体的数値に基づいた分析と技術的指導を行う。",
+  "2. 栄養士: PFCバランスを推測し、次に摂取すべき具体的食材を提示する。",
+  "3. カウンセラー: 心理学的に寄り添い、明日へのモチベーションを高める。",
+  "・過去の会話履歴を把握し、文脈に沿った回答をする。",
+  "・LINEで読みやすいよう、適宜改行や絵文字、箇条書きを使う。"
 ].join("\n");
 
 if (!LINE_TOKEN || !LINE_SECRET) {
@@ -52,17 +50,19 @@ if (!LINE_TOKEN || !LINE_SECRET) {
       const userId = event.source.userId;
       const userText = (event.message.text || "").trim();
 
-     try {
-        // 1. 会話履歴の取得（エラー回避のため orderBy を一時的に削除）
-        console.log(`Attempting to fetch history for user: ${userId}`);
+      try {
+        console.log(`[LOG] Start processing for user: ${userId}`);
+
+        // 1. 会話履歴の取得（一旦シンプルに取得）
         const historyRef = db.collection("users").doc(userId).collection("history")
-          .limit(6); 
+          .orderBy("createdAt", "desc")
+          .limit(6);
         
         const snapshot = await historyRef.get();
         let pastMessages = [];
         snapshot.forEach(doc => {
           const data = doc.data();
-          pastMessages.push({ role: data.role, content: data.content });
+          pastMessages.unshift({ role: data.role, content: data.content });
         });
 
         // 2. OpenAI API呼び出し
@@ -75,26 +75,26 @@ if (!LINE_TOKEN || !LINE_SECRET) {
           ],
         });
 
-        const aiText = completion.choices[0].message.content || "回答を生成できませんでした。";
+        const aiText = completion.choices[0].message.content || "アドバイスを生成できませんでした。";
 
-        // 3. Firestoreへの保存（ここが最重要！）
-        console.log("Attempting to save messages to Firestore...");
+        // 3. Firestoreへの保存
+        console.log("[LOG] Saving to Firestore...");
+        const batch = db.batch();
         const userLogRef = db.collection("users").doc(userId).collection("history").doc();
         const aiLogRef = db.collection("users").doc(userId).collection("history").doc();
 
-        await Promise.all([
-          userLogRef.set({ 
-            role: "user", 
-            content: userText, 
-            createdAt: admin.firestore.FieldValue.serverTimestamp() 
-          }),
-          aiLogRef.set({ 
-            role: "assistant", 
-            content: aiText, 
-            createdAt: admin.firestore.FieldValue.serverTimestamp() 
-          })
-        ]);
-        console.log("Successfully saved to Firestore!");
+        batch.set(userLogRef, { 
+          role: "user", 
+          content: userText, 
+          createdAt: admin.firestore.FieldValue.serverTimestamp() 
+        });
+        batch.set(aiLogRef, { 
+          role: "assistant", 
+          content: aiText, 
+          createdAt: admin.firestore.FieldValue.serverTimestamp() 
+        });
+        await batch.commit();
+        console.log("[LOG] Successfully saved to Firestore");
 
         // 4. LINEに返信
         await client.replyMessage({
@@ -103,11 +103,10 @@ if (!LINE_TOKEN || !LINE_SECRET) {
         });
 
       } catch (err) {
-        // エラーの詳細をログに出力
-        console.error("DETAILED ERROR:", err.code, err.message);
+        console.error("[ERROR DETAILED]", err);
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: "text", text: "少し調子が悪いみたい。ログを確認してね！" }],
+          messages: [{ type: "text", text: "すみません、少し調子が悪いようです。時間を置いてもう一度教えてください！" }],
         });
       }
     }));
