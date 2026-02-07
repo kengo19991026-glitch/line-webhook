@@ -52,19 +52,20 @@ if (!LINE_TOKEN || !LINE_SECRET) {
       const userId = event.source.userId;
       const userText = (event.message.text || "").trim();
 
-      try {
-        // 1. Firestoreから直近の会話履歴（最大6件）を取得
+     try {
+        // 1. 会話履歴の取得（エラー回避のため orderBy を一時的に削除）
+        console.log(`Attempting to fetch history for user: ${userId}`);
         const historyRef = db.collection("users").doc(userId).collection("history")
-          .orderBy("createdAt", "desc")
-          .limit(6);
+          .limit(6); 
+        
         const snapshot = await historyRef.get();
         let pastMessages = [];
         snapshot.forEach(doc => {
           const data = doc.data();
-          pastMessages.unshift({ role: data.role, content: data.content });
+          pastMessages.push({ role: data.role, content: data.content });
         });
 
-        // 2. OpenAI API呼び出し（履歴を含めて送信）
+        // 2. OpenAI API呼び出し
         const completion = await openai.chat.completions.create({
           model: "gpt-4o",
           messages: [
@@ -74,24 +75,26 @@ if (!LINE_TOKEN || !LINE_SECRET) {
           ],
         });
 
-        const aiText = completion.choices[0].message.content || "申し訳ありません。アドバイスを生成できませんでした。";
+        const aiText = completion.choices[0].message.content || "回答を生成できませんでした。";
 
-        // 3. 今回の会話（ユーザーとAI両方）を保存
-        const batch = db.batch();
+        // 3. Firestoreへの保存（ここが最重要！）
+        console.log("Attempting to save messages to Firestore...");
         const userLogRef = db.collection("users").doc(userId).collection("history").doc();
         const aiLogRef = db.collection("users").doc(userId).collection("history").doc();
 
-        batch.set(userLogRef, { 
-          role: "user", 
-          content: userText, 
-          createdAt: admin.firestore.FieldValue.serverTimestamp() 
-        });
-        batch.set(aiLogRef, { 
-          role: "assistant", 
-          content: aiText, 
-          createdAt: admin.firestore.FieldValue.serverTimestamp() 
-        });
-        await batch.commit();
+        await Promise.all([
+          userLogRef.set({ 
+            role: "user", 
+            content: userText, 
+            createdAt: admin.firestore.FieldValue.serverTimestamp() 
+          }),
+          aiLogRef.set({ 
+            role: "assistant", 
+            content: aiText, 
+            createdAt: admin.firestore.FieldValue.serverTimestamp() 
+          })
+        ]);
+        console.log("Successfully saved to Firestore!");
 
         // 4. LINEに返信
         await client.replyMessage({
@@ -100,10 +103,11 @@ if (!LINE_TOKEN || !LINE_SECRET) {
         });
 
       } catch (err) {
-        console.error("Error:", err);
+        // エラーの詳細をログに出力
+        console.error("DETAILED ERROR:", err.code, err.message);
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: "text", text: "少し通信が不安定なようです。もう一度送っていただけますか？" }],
+          messages: [{ type: "text", text: "少し調子が悪いみたい。ログを確認してね！" }],
         });
       }
     }));
