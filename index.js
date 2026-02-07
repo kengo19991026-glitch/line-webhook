@@ -18,34 +18,31 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const client = new line.messagingApi.MessagingApiClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 const blobClient = new line.messagingApi.MessagingApiBlobClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 
-// --- 3. modeAI 専用プロンプト（データ強制ガード機能付き） ---
+// --- 3. modeAI 専用プロンプト（データ受取最優先・即時反映ロジック） ---
 const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」です。
+トレーナー・栄養士の専門知識を「深いメンタルケア」で包み込むプロのアドバイザーです。
 
-【最重要ルール：データがない場合の対応】
-提供されたユーザー情報（JSON）を確認し、「weight（体重）」や「goal（目標）」が空、または未定義の場合、**具体的なアドバイスを一切拒否してください。**
-その代わり、以下の定型文のみを返してデータを要求してください。
+【最優先：データ受取と保存のロジック】
+1. ユーザーから「身長・体重・年齢・体脂肪率・目標」などの数値がメッセージ（userContent）に含まれている場合、**他のどのルールよりも優先してその数値を読み取り、回答の末尾に必ず [SAVE_PROFILE] タグを付与して保存してください。**
+2. データを送ってくれた瞬間、拒否することなく「データをありがとうございます。内容を把握しました」と伝え、そのままプロとしての具体的な分析や激励を開始してください。
+3. 過去のデータ（JSON）が空であっても、今回のメッセージでデータが提供されていれば、それは「データがある状態」として扱います。
+4. 全くデータがなく、かつ今回も提示されていない場合のみ、具体的な助言を控え、データを要求してください。
 
-「プロとして的確なアドバイスをするために、まずはあなたの現状を教えていただけますか？
-・身長
-・体重
-・年齢
-・体脂肪率
-・目標
-を教えてください。このデータをもとに、あなた専用のプランを構築します。」
+【食事解析のフォーマット】
+画像解析時は、必ず冒頭に以下を数値で出力：
+カロリー：〇〇kcal
+タンパク質：〇〇g
+脂質：〇〇g
+炭水化物：〇〇g
+（上記は画像からの推定です）
 
-※データが揃うまでは、食事解析やトレーニング指導を行わないでください（ハルシネーション防止のため）。
-
-【データが揃っている場合の振る舞い】
-・画像解析：必ず冒頭に【分析結果】として「料理名・カロリー・PFC」を数値リストで出力。
-・通常会話：トレーナー・栄養士の視点に、大人のメンタルケア（激励と共感）を込めて回答。
-・口調：洗練された敬語。絵文字は控えめに、知的な印象を与えること。
-
-【プロフィール管理】
-会話から新しい身体データ（体重、体脂肪率、年齢など）を得た場合のみ、回答の最後に以下を付与：
+【プロフィール管理タグ（絶対必須）】
+数値を検知・更新した際は必ず末尾に付与（1つでも数値があれば付与）：
 [SAVE_PROFILE: {"weight": 数値, "height": 数値, "fatPercentage": 数値, "age": 数値, "targetWeight": 数値, "goal": "文字列"}]
-`;
 
-// 重複防止キャッシュ
+【口調】
+洗練された敬語。大人の余裕と、目標達成への強い並走感。`;
+
 const eventCache = new Set();
 
 app.post("/webhook", line.middleware({ 
@@ -72,16 +69,14 @@ async function handleModeAI(event) {
   const userId = event.source.userId;
   let userContent;
 
-  // メッセージ判別
   if (event.type === "message" && event.message.type === "text") {
     userContent = [{ type: "text", text: event.message.text }];
   } else if (event.type === "message" && event.message.type === "image") {
     const blob = await blobClient.getMessageContent(event.message.id);
     const buffer = await streamToBuffer(blob);
     const base64Image = buffer.toString("base64");
-    
     userContent = [
-      { type: "text", text: "この料理の栄養素を分析し、指定されたフォーマット（カロリー、PFC）で数値を出力してください。" },
+      { type: "text", text: "この料理の栄養素を分析し、指定のフォーマットで数値を出力してください。" },
       { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
     ];
   } else {
@@ -93,12 +88,7 @@ async function handleModeAI(event) {
   let pastMessages = [];
   try {
     const profileDoc = await db.collection("users").doc(userId).get();
-    if (profileDoc.exists) {
-        profileData = profileDoc.data();
-    } else {
-        // 新規ユーザーでデータがない場合、空であることを明示
-        profileData = { weight: null, goal: null }; 
-    }
+    profileData = profileDoc.exists ? profileDoc.data() : { weight: null, height: null, goal: null };
     
     const snap = await db.collection("users").doc(userId).collection("history").orderBy("createdAt", "desc").limit(6).get();
     if (!snap.empty) {
@@ -106,28 +96,32 @@ async function handleModeAI(event) {
     }
   } catch (e) { console.error("DB Error:", e); }
 
-  // OpenAI 呼び出し
+  // OpenAI 呼び出し（指示の優先順位を明確化）
   const completion = await openai.chat.completions.create({
     model: "gpt-4o",
     messages: [
-      { role: "system", content: SYSTEM_PROMPT + "\n【ユーザー情報(必須)】" + JSON.stringify(profileData) },
+      { role: "system", content: SYSTEM_PROMPT + "\n\n【DBに登録済みのユーザーデータ】" + JSON.stringify(profileData) },
       ...pastMessages,
       { role: "user", content: userContent }
     ],
-    temperature: 0.2, 
-    max_tokens: 800
+    temperature: 0.2
   });
 
   let aiResponse = completion.choices[0].message.content || "";
 
-  // プロフィール更新処理
+  // [SAVE_PROFILE] タグの処理とFirestore保存
   const saveMatch = aiResponse.match(/\[SAVE_PROFILE: ({.*?})\]/);
   if (saveMatch) {
     try {
       const newData = JSON.parse(saveMatch[1]);
-      await db.collection("users").doc(userId).set(newData, { merge: true });
+      // nullやundefinedを除外してクリーンなデータにする
+      const cleanData = Object.fromEntries(Object.entries(newData).filter(([_, v]) => v != null));
+      await db.collection("users").doc(userId).set(cleanData, { merge: true });
       aiResponse = aiResponse.replace(/\[SAVE_PROFILE: {.*?}\]/g, "").trim();
-    } catch (e) {}
+      console.log(`[SUCCESS] Profile updated for user: ${userId}`);
+    } catch (e) {
+      console.error("Save Match Error:", e);
+    }
   }
 
   await client.pushMessage({ to: userId, messages: [{ type: "text", text: aiResponse }] });
