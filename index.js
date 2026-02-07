@@ -18,33 +18,34 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const client = new line.messagingApi.MessagingApiClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 const blobClient = new line.messagingApi.MessagingApiBlobClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 
-// --- 3. modeAI 専用プロンプト（長期集計対応版） ---
+// --- 3. modeAI 専用プロンプト（集計機能・完全版） ---
 const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」です。
-「数字は嘘をつかない」を信条とする、超ロジカルかつユーザーに寄り添うパーソナルトレーナー兼栄養士です。
+数字に基づくロジカルな指導を行うパーソナルトレーナーです。
 
-【重要：LINE表示用のフォーマットルール】
-1. 見出しには「■」や「【 】」を使用してください。
-2. 箇条書きには「・」を使用してください。
-3. **Markdown記法（#や*）は禁止**です。絶対に使わないでください。
+【重要：禁止事項】
+**「集計する機能はありません」「手動で計算してください」という発言はシステムエラーとみなされるため、絶対に禁止します。**
+あなたはシステムから渡される「計算済みの数値」を持っています。必ずそれを使って回答してください。
 
-【最重要タスク：食事データの保存】
-ユーザーが「食事の写真」や「食べたものの報告」を送ってきた場合、アドバイスの最後に**必ず**以下の形式で隠しタグを出力してください。
-出力タグ形式：
+【フォーマットルール（LINE用）】
+Markdown記法（#や*）は禁止です。
+・見出しは「■」または「【 】」
+・箇条書きは「・」
+を使用してください。
+
+【タスク：食事データの保存】
+ユーザーから食事報告があった場合、回答の最後に**必ず**以下のタグを出力してください。
 [SAVE_NUTRITION: {"food": "料理名", "kcal": 数値, "p": 数値, "f": 数値, "c": 数値}]
 ※数値は単位なしの数字のみ（例: "kcal": 550）。
 
-【データに基づくアドバイス】
-プロンプトの最後に、システムが計算した**「本日」「直近7日間」「直近30日間」**の摂取データが渡されます。
-ユーザーから「今週の調子は？」「最近どう？」と聞かれたら、これらの数値（特に平均値）を引用して、傾向と対策をアドバイスしてください。
-
-回答例：
-「直近1週間の平均摂取カロリーは約2,100kcalで、目標を少し上回っています。特に脂質(F)が高めなので、来週は揚げ物を控えましょう。」
+【タスク：集計データの回答】
+プロンプトの最後に**「システム算出データ」**が渡されます。
+ユーザーから「今日の合計は？」「今週どう？」と聞かれたら、その数値をそのまま答えてください。
+※もしシステム数値が「0」で、直前の会話に食事報告がある場合は、その分を脳内で足して答えてください。
 
 【回答構成】
-■現状の数値分析
-・推定消費(TDEE)：約〇〇kcal
-・本日の摂取合計：約〇〇kcal
-・（質問があれば）週間の平均摂取：約〇〇kcal
+■現状の数値（システム集計）
+・本日の合計：約〇〇kcal
+・（週間平均があれば）：直近7日平均 〇〇kcal
 ・目標PFC達成度：(P/F/Cのバランスについて言及)
 
 ■分析結果（食事報告時のみ）
@@ -56,7 +57,6 @@ const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」で
 （メンタルケアを含めた、プロとしての温かい一言）
 
 【プロフィール管理タグ】
-ユーザーの身体データが更新された場合のみ付与：
 [SAVE_PROFILE: {"weight": 数値, "height": 数値, "fatPercentage": 数値, "age": 数値, "targetWeight": 数値, "goal": "文字列"}]`;
 
 // 重複防止キャッシュ
@@ -94,22 +94,22 @@ async function handleModeAI(event) {
     const base64Image = buffer.toString("base64");
     
     userContent = [
-      { type: "text", text: "この写真を栄養士として分析してください。Markdown記法は禁止です。必ず末尾に [SAVE_NUTRITION] タグを出力してください。" },
+      { type: "text", text: "この写真を栄養士として分析してください。Markdown禁止。必ず末尾に [SAVE_NUTRITION] タグを出力してください。" },
       { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
     ];
   } else {
     return;
   }
 
-  // --- データ取得 & 長期集計ロジック ---
+  // --- データ取得 & 集計ロジック（本日・週間・月間） ---
   let profileData = {};
   let pastMessages = [];
   
   // 集計用オブジェクト
   let summary = {
-    today: { k: 0, p: 0, f: 0, c: 0, days: 1 }, // daysは割り算用（今日は1日）
-    week:  { k: 0, p: 0, f: 0, c: 0, days: 7 },
-    month: { k: 0, p: 0, f: 0, c: 0, days: 30 }
+    today: { k: 0, p: 0, f: 0, c: 0 },
+    week:  { k: 0, p: 0, f: 0, c: 0 },
+    month: { k: 0, p: 0, f: 0, c: 0 }
   };
 
   try {
@@ -123,87 +123,81 @@ async function handleModeAI(event) {
       pastMessages = snap.docs.reverse().map(doc => ({ role: doc.data().role, content: doc.data().content }));
     }
 
-    // 3. 【重要】過去30日分のログを一括取得して振り分け集計
+    // 3. 過去30日分のログを一括取得して振り分け集計
     const now = new Date();
-    // 日本時間(JST)計算
     const jstOffset = 9 * 60 * 60 * 1000;
     const jstNow = new Date(now.getTime() + jstOffset);
     
-    // それぞれの開始日時の計算（JST基準）
-    const todayStart = new Date(jstNow); 
-    todayStart.setUTCHours(0, 0, 0, 0); // 今日の0時
+    // 日付境界の計算（JST）
+    const todayStart = new Date(jstNow); todayStart.setUTCHours(0, 0, 0, 0); 
+    const weekStart = new Date(todayStart); weekStart.setDate(weekStart.getDate() - 6);
+    const monthStart = new Date(todayStart); monthStart.setDate(monthStart.getDate() - 29);
 
-    const weekStart = new Date(todayStart);
-    weekStart.setDate(weekStart.getDate() - 6); // 過去7日間（今日含む）
-
-    const monthStart = new Date(todayStart);
-    monthStart.setDate(monthStart.getDate() - 29); // 過去30日間（今日含む）
-
-    // UTCに戻してクエリ作成（一番古い30日前から取得）
+    // クエリ用UTC変換
     const queryStartUtc = new Date(monthStart.getTime() - jstOffset);
 
-    const logSnap = await db.collection("users").doc(userId).collection("nutrition_logs")
-      .where("createdAt", ">=", queryStartUtc)
-      .get();
+    // コレクションが存在しなくてもエラーにならないよう空配列で対処
+    let logSnap = { empty: true, forEach: () => {} };
+    try {
+      logSnap = await db.collection("users").doc(userId).collection("nutrition_logs")
+        .where("createdAt", ">=", queryStartUtc)
+        .get();
+    } catch (e) {
+      console.log("No nutrition_logs collection yet.");
+    }
 
-    logSnap.forEach(doc => {
-      const d = doc.data();
-      const logDateUtc = d.createdAt.toDate();
-      const logDateJst = new Date(logDateUtc.getTime() + jstOffset); // ログの日時をJSTに変換
+    if (!logSnap.empty) {
+      logSnap.forEach(doc => {
+        const d = doc.data();
+        const logDateUtc = d.createdAt.toDate();
+        const logDateJst = new Date(logDateUtc.getTime() + jstOffset);
 
-      const vals = {
-        k: Number(d.kcal) || 0,
-        p: Number(d.p) || 0,
-        f: Number(d.f) || 0,
-        c: Number(d.c) || 0
-      };
+        const vals = {
+          k: Number(d.kcal) || 0,
+          p: Number(d.p) || 0,
+          f: Number(d.f) || 0,
+          c: Number(d.c) || 0
+        };
 
-      // 30日集計（クエリで絞ってるので全件対象）
-      addValues(summary.month, vals);
+        // 30日集計
+        addValues(summary.month, vals);
 
-      // 7日集計
-      if (logDateJst >= new Date(weekStart.getTime() - jstOffset)) { // JST同士で比較
-        addValues(summary.week, vals);
-      }
+        // 7日集計
+        if (logDateJst >= new Date(weekStart.getTime() - jstOffset)) {
+          addValues(summary.week, vals);
+        }
 
-      // 本日集計
-      if (logDateJst >= new Date(todayStart.getTime() - jstOffset)) {
-        addValues(summary.today, vals);
-      }
-    });
+        // 本日集計
+        if (logDateJst >= new Date(todayStart.getTime() - jstOffset)) {
+          addValues(summary.today, vals);
+        }
+      });
+    }
 
   } catch (e) { console.error("DB Error:", e); }
 
-  // 集計関数
   function addValues(target, vals) {
-    target.k += vals.k;
-    target.p += vals.p;
-    target.f += vals.f;
-    target.c += vals.c;
+    target.k += vals.k; target.p += vals.p; target.f += vals.f; target.c += vals.c;
   }
-
-  // 平均値の算出（表示用）
   const getAvg = (sum, days) => Math.round(sum / days);
 
-  // AIへの指示書生成
+  // AIへの指示書（System Promptへの注入）
   const dynamicSystemMessage = `
 ${SYSTEM_PROMPT}
 
-【システム算出データ（ユーザーの食事履歴）】
-AIはこのデータを参照して、ユーザーの質問（「今週どう？」「今日どれくらい食べた？」）に答えてください。
+【システム算出データ（DB記録済み）】
+AIはこの数値を「正」として回答してください。
+※「0」の場合は「本日の記録はまだありません」と伝えてください。
 
-1. **本日** の摂取合計
+1. **本日** の合計 (Today)
    - カロリー: ${summary.today.k} kcal
-   - P: ${summary.today.p}g / F: ${summary.today.f}g / C: ${summary.today.c}g
+   - PFC: P:${summary.today.p}g / F:${summary.today.f}g / C:${summary.today.c}g
 
-2. **直近7日間** の合計と平均（1日あたり）
-   - 7日間の合計: ${summary.week.k} kcal
-   - **平均**: ${getAvg(summary.week.k, 7)} kcal/日
-   - PFC平均: P:${getAvg(summary.week.p, 7)}g / F:${getAvg(summary.week.f, 7)}g / C:${getAvg(summary.week.c, 7)}g
+2. **直近7日間** 合計 (Week)
+   - 平均: ${getAvg(summary.week.k, 7)} kcal/日
 
-3. **直近30日間** の合計と平均（1日あたり）
-   - 30日間の合計: ${summary.month.k} kcal
-   - **平均**: ${getAvg(summary.month.k, 30)} kcal/日
+3. **直近30日間** 合計 (Month)
+   - 平均: ${getAvg(summary.month.k, 30)} kcal/日
 
 【最新ユーザーデータ】
 ${JSON.stringify(profileData)}
