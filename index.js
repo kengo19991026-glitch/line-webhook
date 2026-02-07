@@ -18,7 +18,7 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const client = new line.messagingApi.MessagingApiClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 const blobClient = new line.messagingApi.MessagingApiBlobClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 
-// --- 3. modeAI 専用プロンプト（ログ保存・強制強化版） ---
+// --- 3. modeAI 専用プロンプト（長期集計対応版） ---
 const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」です。
 「数字は嘘をつかない」を信条とする、超ロジカルかつユーザーに寄り添うパーソナルトレーナー兼栄養士です。
 
@@ -29,24 +29,25 @@ const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」で
 
 【最重要タスク：食事データの保存】
 ユーザーが「食事の写真」や「食べたものの報告」を送ってきた場合、アドバイスの最後に**必ず**以下の形式で隠しタグを出力してください。
-これがないとデータベースに記録されません。
-
 出力タグ形式：
 [SAVE_NUTRITION: {"food": "料理名", "kcal": 数値, "p": 数値, "f": 数値, "c": 数値}]
+※数値は単位なしの数字のみ（例: "kcal": 550）。
 
-※注意点：
-・数値には「kcal」や「g」などの単位をつけず、純粋な数字だけにしてください。（例: "kcal": 550）
-・前後に余計な文字を入れないでください。
+【データに基づくアドバイス】
+プロンプトの最後に、システムが計算した**「本日」「直近7日間」「直近30日間」**の摂取データが渡されます。
+ユーザーから「今週の調子は？」「最近どう？」と聞かれたら、これらの数値（特に平均値）を引用して、傾向と対策をアドバイスしてください。
+
+回答例：
+「直近1週間の平均摂取カロリーは約2,100kcalで、目標を少し上回っています。特に脂質(F)が高めなので、来週は揚げ物を控えましょう。」
 
 【回答構成】
-挨拶は手短にし、すぐに以下の形式で数値を出してください。
-
 ■現状の数値分析
 ・推定消費(TDEE)：約〇〇kcal
-・目標摂取：約〇〇kcal
-・目標PFC：P:〇〇g / F:〇〇g / C:〇〇g
+・本日の摂取合計：約〇〇kcal
+・（質問があれば）週間の平均摂取：約〇〇kcal
+・目標PFC達成度：(P/F/Cのバランスについて言及)
 
-■分析結果（食事の場合）
+■分析結果（食事報告時のみ）
 ・料理名：〇〇
 ・カロリー：〇〇kcal
 ・PFC：P:〇〇g / F:〇〇g / C:〇〇g
@@ -92,33 +93,127 @@ async function handleModeAI(event) {
     const buffer = await streamToBuffer(blob);
     const base64Image = buffer.toString("base64");
     
-    // 画像送信時、ログ保存タグを出すよう強く指示
     userContent = [
-      { type: "text", text: "この写真を栄養士として分析してください。Markdown記法は禁止です。また、分析結果のカロリーとPFCをデータベースに保存するため、必ず末尾に [SAVE_NUTRITION] タグを正しいJSON形式で出力してください。" },
+      { type: "text", text: "この写真を栄養士として分析してください。Markdown記法は禁止です。必ず末尾に [SAVE_NUTRITION] タグを出力してください。" },
       { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
     ];
   } else {
     return;
   }
 
-  // データ取得
+  // --- データ取得 & 長期集計ロジック ---
   let profileData = {};
   let pastMessages = [];
+  
+  // 集計用オブジェクト
+  let summary = {
+    today: { k: 0, p: 0, f: 0, c: 0, days: 1 }, // daysは割り算用（今日は1日）
+    week:  { k: 0, p: 0, f: 0, c: 0, days: 7 },
+    month: { k: 0, p: 0, f: 0, c: 0, days: 30 }
+  };
+
   try {
+    // 1. プロフィール取得
     const profileDoc = await db.collection("users").doc(userId).get();
     profileData = profileDoc.exists ? profileDoc.data() : { weight: null };
-    
+
+    // 2. 履歴取得
     const snap = await db.collection("users").doc(userId).collection("history").orderBy("createdAt", "desc").limit(4).get();
     if (!snap.empty) {
       pastMessages = snap.docs.reverse().map(doc => ({ role: doc.data().role, content: doc.data().content }));
     }
+
+    // 3. 【重要】過去30日分のログを一括取得して振り分け集計
+    const now = new Date();
+    // 日本時間(JST)計算
+    const jstOffset = 9 * 60 * 60 * 1000;
+    const jstNow = new Date(now.getTime() + jstOffset);
+    
+    // それぞれの開始日時の計算（JST基準）
+    const todayStart = new Date(jstNow); 
+    todayStart.setUTCHours(0, 0, 0, 0); // 今日の0時
+
+    const weekStart = new Date(todayStart);
+    weekStart.setDate(weekStart.getDate() - 6); // 過去7日間（今日含む）
+
+    const monthStart = new Date(todayStart);
+    monthStart.setDate(monthStart.getDate() - 29); // 過去30日間（今日含む）
+
+    // UTCに戻してクエリ作成（一番古い30日前から取得）
+    const queryStartUtc = new Date(monthStart.getTime() - jstOffset);
+
+    const logSnap = await db.collection("users").doc(userId).collection("nutrition_logs")
+      .where("createdAt", ">=", queryStartUtc)
+      .get();
+
+    logSnap.forEach(doc => {
+      const d = doc.data();
+      const logDateUtc = d.createdAt.toDate();
+      const logDateJst = new Date(logDateUtc.getTime() + jstOffset); // ログの日時をJSTに変換
+
+      const vals = {
+        k: Number(d.kcal) || 0,
+        p: Number(d.p) || 0,
+        f: Number(d.f) || 0,
+        c: Number(d.c) || 0
+      };
+
+      // 30日集計（クエリで絞ってるので全件対象）
+      addValues(summary.month, vals);
+
+      // 7日集計
+      if (logDateJst >= new Date(weekStart.getTime() - jstOffset)) { // JST同士で比較
+        addValues(summary.week, vals);
+      }
+
+      // 本日集計
+      if (logDateJst >= new Date(todayStart.getTime() - jstOffset)) {
+        addValues(summary.today, vals);
+      }
+    });
+
   } catch (e) { console.error("DB Error:", e); }
+
+  // 集計関数
+  function addValues(target, vals) {
+    target.k += vals.k;
+    target.p += vals.p;
+    target.f += vals.f;
+    target.c += vals.c;
+  }
+
+  // 平均値の算出（表示用）
+  const getAvg = (sum, days) => Math.round(sum / days);
+
+  // AIへの指示書生成
+  const dynamicSystemMessage = `
+${SYSTEM_PROMPT}
+
+【システム算出データ（ユーザーの食事履歴）】
+AIはこのデータを参照して、ユーザーの質問（「今週どう？」「今日どれくらい食べた？」）に答えてください。
+
+1. **本日** の摂取合計
+   - カロリー: ${summary.today.k} kcal
+   - P: ${summary.today.p}g / F: ${summary.today.f}g / C: ${summary.today.c}g
+
+2. **直近7日間** の合計と平均（1日あたり）
+   - 7日間の合計: ${summary.week.k} kcal
+   - **平均**: ${getAvg(summary.week.k, 7)} kcal/日
+   - PFC平均: P:${getAvg(summary.week.p, 7)}g / F:${getAvg(summary.week.f, 7)}g / C:${getAvg(summary.week.c, 7)}g
+
+3. **直近30日間** の合計と平均（1日あたり）
+   - 30日間の合計: ${summary.month.k} kcal
+   - **平均**: ${getAvg(summary.month.k, 30)} kcal/日
+
+【最新ユーザーデータ】
+${JSON.stringify(profileData)}
+`;
 
   // OpenAI 呼び出し
   const completion = await openai.chat.completions.create({
     model: "gpt-4o",
     messages: [
-      { role: "system", content: SYSTEM_PROMPT + "\n\n【最新ユーザーデータ】" + JSON.stringify(profileData) },
+      { role: "system", content: dynamicSystemMessage },
       ...pastMessages,
       { role: "user", content: userContent }
     ],
@@ -127,15 +222,12 @@ async function handleModeAI(event) {
 
   let aiResponse = completion.choices[0].message.content || "";
 
-  // --- 1. 食事ログ保存処理（正規表現を強化） ---
-  // 改行が含まれていてもマッチするように [\s\S]*? を使用
+  // --- 保存処理 (食事ログ) ---
   const saveNutritionMatch = aiResponse.match(/\[SAVE_NUTRITION: (\{[\s\S]*?\})\]/);
   if (saveNutritionMatch) {
     try {
       const jsonStr = saveNutritionMatch[1];
       const nutritionData = JSON.parse(jsonStr);
-      
-      // 数値型への変換（AIが文字列で返した場合の保険）
       const safeData = {
         food: nutritionData.food || "不明な食事",
         kcal: Number(nutritionData.kcal) || 0,
@@ -144,16 +236,11 @@ async function handleModeAI(event) {
         c: Number(nutritionData.c) || 0,
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       };
-
       await db.collection("users").doc(userId).collection("nutrition_logs").add(safeData);
-      console.log(`[SUCCESS] Nutrition log saved for user: ${userId}`);
-    } catch (e) {
-      console.error("[ERROR] Nutrition JSON parse failed:", e);
-      // ここでエラーが出てもユーザーへの返信は止めない
-    }
+    } catch (e) { console.error("Nutrition Save Error:", e); }
   }
 
-  // --- 2. プロフィール保存処理 ---
+  // --- 保存処理 (プロフィール) ---
   const saveProfileMatch = aiResponse.match(/\[SAVE_PROFILE: (\{[\s\S]*?\})\]/);
   if (saveProfileMatch) {
     try {
@@ -162,7 +249,7 @@ async function handleModeAI(event) {
     } catch (e) {}
   }
 
-  // --- クリーニング処理 ---
+  // --- クリーニング ---
   aiResponse = cleanMarkdown(aiResponse);
 
   await client.pushMessage({ to: userId, messages: [{ type: "text", text: aiResponse }] });
@@ -180,17 +267,12 @@ async function handleModeAI(event) {
 // --- マークダウン除去専用関数 ---
 function cleanMarkdown(text) {
   let cleaned = text;
-  
-  // 保存用タグを削除（改行対応）
   cleaned = cleaned.replace(/\[SAVE_PROFILE: \{[\s\S]*?\}\]/g, "");
   cleaned = cleaned.replace(/\[SAVE_NUTRITION: \{[\s\S]*?\}\]/g, "");
-
-  // マークダウン記号の削除・置換
-  cleaned = cleaned.replace(/\*\*(.*?)\*\*/g, "$1"); // 太字
-  cleaned = cleaned.replace(/^#{1,6}\s+/gm, "■ "); // 見出し
-  cleaned = cleaned.replace(/^[\*\-]\s+/gm, "・"); // リスト
-  cleaned = cleaned.replace(/`/g, ""); // バッククォート
-
+  cleaned = cleaned.replace(/\*\*(.*?)\*\*/g, "$1");
+  cleaned = cleaned.replace(/^#{1,6}\s+/gm, "■ ");
+  cleaned = cleaned.replace(/^[\*\-]\s+/gm, "・");
+  cleaned = cleaned.replace(/`/g, "");
   return cleaned.trim();
 }
 
