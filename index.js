@@ -22,22 +22,21 @@ const client = new line.messagingApi.MessagingApiClient({
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN 
 });
 
-// --- 3. modeAI 専用プロンプト ---
+// --- 3. modeAI 専用プロンプト（体脂肪率の項目を追加） ---
 const SYSTEM_PROMPT = `
 あなたの名前は「modeAI（モードアイ）」です。
-一流のパーソナルトレーナー、管理栄養士、心理カウンセラーを統合した、大人向けの洗練されたAIアドバイザーです。
+一流のトレーナー、栄養士、カウンセラーを統合した、大人向けの洗練されたAIアドバイザーです。
+
+【重要な任務】
+・ユーザーの「身長・体重・体脂肪率・目標」を把握し、それに基づいた専門的な数値を提示してください。
+・体脂肪率の変化は、筋肉量の増減や食事の質を判断する重要な指標として扱ってください。
 
 【新規ユーザーへの対応】
-・相手が初めての利用者の場合は、丁寧に自己紹介をし、これから一緒に目標を目指すパートナーであることを伝えてください。
-・まずは「身長、体重、目標」を教えてもらうよう促してください。
+・相手が初めて、またはデータが不足している場合は、丁寧に自己紹介をし、「身長、体重、体脂肪率、目標体重」を教えてもらうよう促してください。
 
-【基本ルール】
-・落ち着いた、知的な口調（です・ます調）を維持。
-・「私たちは最高のチームです」という姿勢。
-・回答は簡潔に構造化し、適度な改行と絵文字を使用。
-
-【専門モード】
-キーワード（トレーナー/筋トレ、栄養士/食事、カウンセラー/相談）に応じて専門性を高めてください。
+【プロフィール更新ルール】
+会話で新しい身体データ（体重、体脂肪率等）を検知した場合は、必ず回答の末尾に以下を付与してください。
+[SAVE_PROFILE: {"weight": 数値, "height": 数値, "fatPercentage": 数値, "targetWeight": 数値, "goal": "文字列"}]
 `;
 
 const eventCache = new Set();
@@ -64,7 +63,7 @@ async function handleModeAI(event) {
   const userId = event.source.userId;
   const userText = event.message.text;
 
-  // --- 4. データの取得（エラーハンドリング強化） ---
+  // --- 4. データの取得（安全な読み込み） ---
   let profileData = {};
   let pastMessages = [];
 
@@ -74,7 +73,6 @@ async function handleModeAI(event) {
       profileData = profileDoc.data();
     }
 
-    // 履歴取得（空でもエラーにならないようにする）
     const historySnapshot = await db.collection("users").doc(userId)
       .collection("history").orderBy("createdAt", "desc").limit(6).get();
     
@@ -85,15 +83,14 @@ async function handleModeAI(event) {
       }));
     }
   } catch (dbError) {
-    console.error("Firestore Read Error:", dbError);
-    // DBエラーでも会話を続行させるため、空のまま進む
+    console.error("Database Read Error:", dbError);
   }
 
   // --- 5. OpenAI 呼び出し ---
   const completion = await openai.chat.completions.create({
     model: "gpt-4o", 
     messages: [
-      { role: "system", content: SYSTEM_PROMPT + "\n【ユーザー情報】 " + JSON.stringify(profileData) },
+      { role: "system", content: SYSTEM_PROMPT + "\n【現在のユーザーデータ】 " + JSON.stringify(profileData) },
       ...pastMessages,
       { role: "user", content: userText }
     ],
@@ -102,20 +99,20 @@ async function handleModeAI(event) {
 
   let aiResponse = completion.choices[0].message.content || "";
 
-  // --- 6. プロフィール更新 ---
+  // --- 6. プロフィール更新（fatPercentageに対応） ---
   const saveMatch = aiResponse.match(/\[SAVE_PROFILE: ({.*?})\]/);
   if (saveMatch) {
     try {
       const newData = JSON.parse(saveMatch[1]);
       await db.collection("users").doc(userId).set(newData, { merge: true });
       aiResponse = aiResponse.replace(/\[SAVE_PROFILE: {.*?}\]/g, "").trim();
+      console.log("[LOG] Profile Updated with Fat Percentage");
     } catch (e) {
       console.error("Profile Save Error:", e);
     }
   }
 
-  // --- 7. 送答と保存 ---
-  // 履歴保存に失敗しても返信だけは届くように個別に実行
+  // --- 7. 返信と履歴保存（独立実行） ---
   client.pushMessage({
     to: userId,
     messages: [{ type: "text", text: aiResponse }]
@@ -123,11 +120,11 @@ async function handleModeAI(event) {
 
   db.collection("users").doc(userId).collection("history").add({
     role: "user", content: userText, createdAt: admin.firestore.FieldValue.serverTimestamp()
-  }).catch(e => console.error("History Save Error (User):", e));
+  }).catch(e => console.error("History Save Error (User)"));
 
   db.collection("users").doc(userId).collection("history").add({
     role: "assistant", content: aiResponse, createdAt: admin.firestore.FieldValue.serverTimestamp()
-  }).catch(e => console.error("History Save Error (AI):", e));
+  }).catch(e => console.error("History Save Error (AI)"));
 }
 
 app.listen(PORT, "0.0.0.0");
