@@ -24,7 +24,7 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const client = new line.messagingApi.MessagingApiClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 const blobClient = new line.messagingApi.MessagingApiBlobClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 
-// --- 3. 最強のプロンプト（トレーニング指導特化型） ---
+// --- 3. プロンプト（トレーニング＆栄養指導） ---
 const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」です。
 ロジカルかつ冷徹なまでに正確な、最高峰のAIパーソナルトレーナーです。
 
@@ -32,7 +32,6 @@ const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」で
 ・栄養状態（PFC）から「今日やるべき種目」を具体的に指定せよ。
 ・「重量（kg）」「セット数」「レップ数」「インターバル（秒）」まで数値で提示せよ。
 ・糖質が足りない場合は「強度の低下」を警告し、タンパク質が足りない場合は「休息と補給」を優先させよ。
-・休息の重要性を科学的に説明せよ（超回復、筋グリコーゲン等）。
 
 【出力フォーマット】
 ■ 今回の解析結果
@@ -45,9 +44,6 @@ const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」で
 ・設定：[数値]kg × [数値]回 × [数値]セット
 ・インターバル：[数値]秒
 ・戦略理由：[現在の栄養状態に基づいた論理的な理由]
-
-■ 休息とリカバリー
-・[筋肉を休ませるべきか、動かすべきかの断定的なアドバイス]
 
 【システム管理用タグ】
 ※末尾に必ず付与：[SAVE_NUTRITION: {"food": "料理名", "kcal": 数値, "p": 数値, "f": 数値, "c": 数値}]`;
@@ -103,16 +99,38 @@ const setupRichMenu = async () => {
   } catch (e) { console.error("Menu Setup Error:", e); }
 };
 
-// --- 5. メインロジック（トレーニング特化） ---
+// --- 5. メインロジック（新規登録機能付き） ---
 async function handleModeAI(event) {
   const userId = event.source.userId;
   if (event.type !== "message") return;
+
+  // ★★★ ここが追加箇所：新規ユーザーの自動登録 ★★★
+  try {
+    const userRef = db.collection("users").doc(userId);
+    const userDoc = await userRef.get();
+
+    if (!userDoc.exists) {
+      console.log(`[New User] Creating database for: ${userId}`);
+      // 初回登録時のデフォルトデータ
+      await userRef.set({
+        userId: userId,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        weight: 60,       // 仮の体重
+        height: 170,      // 仮の身長
+        target: "未設定",  // 目標
+        status: "active"
+      });
+    }
+  } catch (dbError) {
+    console.error("DB Init Error:", dbError);
+  }
+  // ★★★★★★★★★★★★★★★★★★★★★★★★★★★
 
   let userContent;
   if (event.message.type === "text") {
     userContent = [{ type: "text", text: event.message.text }];
   } else if (event.message.type === "image") {
-    await client.pushMessage({ to: userId, messages: [{ type: "text", text: "画像を解析し、今日のトレーニングプランを構築しています..." }] });
+    await client.pushMessage({ to: userId, messages: [{ type: "text", text: "画像を解析し、トレーニングプランを構築中..." }] });
     const blob = await blobClient.getMessageContent(event.message.id);
     const chunks = [];
     for await (const chunk of blob) { chunks.push(chunk); }
@@ -124,9 +142,9 @@ async function handleModeAI(event) {
   } else return;
 
   try {
-    // ユーザープロフィールの取得（Firestore）
+    // ユーザー情報の再取得（さっき作ったばかりでも確実に取る）
     const userDoc = await db.collection("users").doc(userId).get();
-    const userData = userDoc.exists ? userDoc.data() : { weight: 70, target: "増量" };
+    const userData = userDoc.data() || { weight: 60, target: "未設定" };
 
     // 今日の合計摂取量
     const now = new Date();
@@ -134,7 +152,7 @@ async function handleModeAI(event) {
     const startOfToday = new Date(jstNow.setUTCHours(0, 0, 0, 0));
     const queryStart = new Date(startOfToday.getTime() - (9 * 60 * 60 * 1000));
     const snap = await db.collection("users").doc(userId).collection("nutrition_logs").where("createdAt", ">=", queryStart).get();
-    let totalKcal = 0, totalP = 0, totalF = 0, totalC = 0;
+    let totalKcal = 0, totalP = 0, totalC = 0;
     snap.forEach(doc => { 
         totalKcal += (Number(doc.data().kcal) || 0); 
         totalP += (Number(doc.data().p) || 0);
