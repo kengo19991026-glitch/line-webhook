@@ -2,24 +2,30 @@ import express from "express";
 import * as line from "@line/bot-sdk";
 import OpenAI from "openai";
 import admin from "firebase-admin";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 
-// --- 1. アプリ設定 ---
+// --- 0. パス設定 (ESモジュール用) ---
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
 
-// --- 2. Firebase 初期化 ---
+// --- 1. Firestore 初期化 ---
 if (!admin.apps.length) {
   admin.initializeApp({ projectId: "project-d3eb52a5-cef2-40c7-bfc" });
 }
 const db = admin.firestore();
 db.settings({ ignoreUndefinedProperties: true });
 
-// --- 3. クライアント初期化 ---
+// --- 2. クライアント初期化 ---
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const client = new line.messagingApi.MessagingApiClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 const blobClient = new line.messagingApi.MessagingApiBlobClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 
-// --- 4. プロンプト設定 ---
+// --- 3. modeAI 専用プロンプト ---
 const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」です。
 あなたは**「どんな画像でも即座に栄養価を算出する世界最高峰のAI」**です。
 
@@ -60,7 +66,7 @@ const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」で
 // 重複防止キャッシュ
 const eventCache = new Set();
 
-// --- ヘルスチェック（TCP Probe対策） ---
+// --- ヘルスチェック ---
 app.get("/", (req, res) => {
   res.status(200).send("OK");
 });
@@ -69,13 +75,12 @@ app.post("/webhook", line.middleware({
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN, 
   channelSecret: process.env.LINE_CHANNEL_SECRET 
 }), (req, res) => {
-  res.status(200).send("OK"); // 即座に200を返し、タイムアウトを防ぐ
+  res.status(200).send("OK");
   
   const events = req.body.events || [];
   events.forEach(async (event) => {
     if (eventCache.has(event.eventId)) return;
     eventCache.add(event.eventId);
-    // 60秒後にキャッシュ削除
     setTimeout(() => eventCache.delete(event.eventId), 60000);
 
     try {
@@ -92,47 +97,41 @@ async function handleModeAI(event) {
   try {
     let userContent;
 
-    // --- メッセージ種別の判定 ---
     if (event.type === "message" && event.message.type === "text") {
       userContent = [{ type: "text", text: event.message.text }];
     } else if (event.type === "message" && event.message.type === "image") {
-      // 解析中メッセージ
       try {
         await client.pushMessage({
           to: userId,
           messages: [{ type: "text", text: "画像を解析しています...少々お待ちください🍳" }]
         });
-      } catch (e) { console.error("Push Error (Ignoring):", e); }
+      } catch (e) {}
 
       const blob = await blobClient.getMessageContent(event.message.id);
       const buffer = await streamToBuffer(blob);
       const base64Image = buffer.toString("base64");
       
       userContent = [
-        { type: "text", text: "この料理の写真を分析せよ。「分析できない」等の言い訳は一切認めない。不鮮明でも推測し、必ず料理名と数値を断定して出力せよ。末尾に [SAVE_NUTRITION] タグを出力すること。" },
+        { type: "text", text: "この料理の写真を分析せよ。不鮮明でも推測し、必ず料理名と数値を断定して出力せよ。末尾に [SAVE_NUTRITION] タグを出力すること。" },
         { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } }
       ];
     } else {
       return; 
     }
 
-    // --- データ取得 & 集計ロジック ---
     let profileData = {};
     let pastMessages = [];
     let summary = { today: { k: 0, p: 0, f: 0, c: 0 }, week: { k: 0 }, month: { k: 0 } };
 
     try {
-      // 1. プロフィール取得
       const profileDoc = await db.collection("users").doc(userId).get();
       if (profileDoc.exists) profileData = profileDoc.data();
 
-      // 2. 履歴取得
       const snap = await db.collection("users").doc(userId).collection("history").orderBy("createdAt", "desc").limit(4).get();
       if (!snap.empty) {
         pastMessages = snap.docs.reverse().map(doc => ({ role: doc.data().role, content: doc.data().content }));
       }
 
-      // 3. ログ集計（ここがクラッシュポイントだったため強化ガード）
       const now = new Date();
       const jstOffset = 9 * 60 * 60 * 1000;
       const jstNow = new Date(now.getTime() + jstOffset);
@@ -147,18 +146,14 @@ async function handleModeAI(event) {
       if (!logSnap.empty) {
         logSnap.forEach(doc => {
           const d = doc.data();
-          // ★日付ガード：createdAtが無い、またはtoDateできないデータはスキップして進む
           let logDateJst;
           try {
             if (d.createdAt && typeof d.createdAt.toDate === 'function') {
                 logDateJst = new Date(d.createdAt.toDate().getTime() + jstOffset);
-            } else {
-                return; // 不正なデータは無視
-            }
+            } else { return; }
           } catch (err) { return; }
 
           const vals = { k: Number(d.kcal)||0, p: Number(d.p)||0, f: Number(d.f)||0, c: Number(d.c)||0 };
-          
           summary.month.k += vals.k;
           if (logDateJst >= new Date(weekStart.getTime() - jstOffset)) summary.week.k += vals.k;
           if (logDateJst >= new Date(todayStart.getTime() - jstOffset)) {
@@ -166,42 +161,28 @@ async function handleModeAI(event) {
           }
         });
       }
-    } catch (e) { 
-      console.log("DB Read Error (Recovered):", e); 
-    }
+    } catch (e) { console.log("DB Read Error (Recovered):", e); }
 
     const getAvg = (sum, days) => Math.round(sum / days);
 
-    // システムメッセージ作成
     const dynamicSystemMessage = `
 ${SYSTEM_PROMPT}
-
-【システム算出データ（参考情報）】
-※以下は過去の記録です。**今送られてきた画像の分析には使用しないでください。**
-今、画像が送られている場合は、このデータに「画像から読み取った数値」を足して、今日の合計を回答してください。
-
+【システム算出データ】
 ・本日記録済み: ${summary.today.k} kcal
 ・直近7日平均: ${getAvg(summary.week.k, 7)} kcal/日
-
 【ユーザー情報】
 ${JSON.stringify(profileData)}
 `;
 
-    // OpenAI 呼び出し
     const completion = await openai.chat.completions.create({
       model: "gpt-4o",
-      messages: [
-        { role: "system", content: dynamicSystemMessage },
-        ...pastMessages,
-        { role: "user", content: userContent }
-      ],
+      messages: [{ role: "system", content: dynamicSystemMessage }, ...pastMessages, { role: "user", content: userContent }],
       temperature: 0.7, 
       max_tokens: 1000
     });
 
     let aiResponse = completion.choices[0].message.content || "";
 
-    // --- 保存処理 ---
     const saveProfileMatch = aiResponse.match(/\[SAVE_PROFILE: (\{[\s\S]*?\})\]/);
     if (saveProfileMatch) {
       try {
@@ -222,17 +203,12 @@ ${JSON.stringify(profileData)}
       } catch (e) {}
     }
 
-    // --- クリーニング ---
     aiResponse = cleanMarkdown(aiResponse);
-
     await client.pushMessage({ to: userId, messages: [{ type: "text", text: aiResponse }] });
 
-    // 履歴保存
-    const historyText = event.message.type === "text" ? event.message.text : "[画像送信]";
-    // エラーが出ても会話を止めないよう catch する
     try {
         await db.collection("users").doc(userId).collection("history").add({
-            role: "user", content: historyText, createdAt: admin.firestore.FieldValue.serverTimestamp()
+            role: "user", content: event.message.type === "text" ? event.message.text : "[画像送信]", createdAt: admin.firestore.FieldValue.serverTimestamp()
         });
         await db.collection("users").doc(userId).collection("history").add({
             role: "assistant", content: aiResponse, createdAt: admin.firestore.FieldValue.serverTimestamp()
@@ -241,22 +217,12 @@ ${JSON.stringify(profileData)}
 
   } catch (error) {
     console.error("Critical Error:", error);
-    // ユーザーへの最終通知
-    try {
-        await client.pushMessage({ to: userId, messages: [{ type: "text", text: "エラーが発生しましたが、復旧しました。もう一度内容を送ってください。" }] });
-    } catch(e) {}
   }
 }
 
-// --- マークダウン除去専用関数 ---
 function cleanMarkdown(text) {
-  let cleaned = text;
-  cleaned = cleaned.replace(/\[SAVE_PROFILE: \{[\s\S]*?\}\]/g, "");
-  cleaned = cleaned.replace(/\[SAVE_NUTRITION: \{[\s\S]*?\}\]/g, "");
-  cleaned = cleaned.replace(/\*\*(.*?)\*\*/g, "$1");
-  cleaned = cleaned.replace(/^#{1,6}\s+/gm, "■ ");
-  cleaned = cleaned.replace(/^[\*\-]\s+/gm, "・");
-  cleaned = cleaned.replace(/`/g, "");
+  let cleaned = text.replace(/\[SAVE_PROFILE: \{[\s\S]*?\}\]/g, "").replace(/\[SAVE_NUTRITION: \{[\s\S]*?\}\]/g, "");
+  cleaned = cleaned.replace(/\*\*(.*?)\*\*/g, "$1").replace(/^#{1,6}\s+/gm, "■ ").replace(/^[\*\-]\s+/gm, "・").replace(/`/g, "");
   return cleaned.trim();
 }
 
@@ -269,12 +235,7 @@ async function streamToBuffer(stream) {
   });
 }
 
-// --- サーバー起動 ---
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server is running on port ${PORT}`);
-});
-
-// --- サーバー起動時にリッチメニューを自動設定する関数 ---
+// --- 4. リッチメニュー自動設定ロジック ---
 const setupRichMenuOnce = async () => {
   try {
     const richMenuObject = {
@@ -292,25 +253,25 @@ const setupRichMenuOnce = async () => {
       ]
     };
 
-    // 1. メニュー作成
     const richMenuId = await client.createRichMenu(richMenuObject);
+    const imagePath = path.join(__dirname, "richmenu.jpg");
     
-    // 2. 画像設定 (richmenu.jpg が GitHub上にあることが前提)
-    const buffer = fs.readFileSync("./richmenu.jpg");
-    const blob = new Blob([buffer], { type: "image/jpeg" });
-    await blobClient.setRichMenuImage(richMenuId.richMenuId, blob);
-    
-    // 3. デフォルトに設定
-    await client.setDefaultRichMenu(richMenuId.richMenuId);
-    console.log("✅ Rich Menu has been automatically set up!");
+    if (fs.existsSync(imagePath)) {
+      const buffer = fs.readFileSync(imagePath);
+      const blob = new Blob([buffer], { type: "image/jpeg" });
+      await blobClient.setRichMenuImage(richMenuId.richMenuId, blob);
+      await client.setDefaultRichMenu(richMenuId.richMenuId);
+      console.log("✅ Rich Menu has been automatically set up!");
+    } else {
+      console.log("⚠️ richmenu.jpg not found. Skip image upload.");
+    }
   } catch (e) {
-    console.log("Rich Menu Setup Skip (Already exists or error):", e.message);
+    console.log("Rich Menu Setup Skip:", e.message);
   }
 };
 
-// サーバー起動直後に実行
+// --- 5. サーバー起動 ---
 app.listen(PORT, "0.0.0.0", async () => {
   console.log(`Server is running on port ${PORT}`);
-  // 起動時にリッチメニュー設定を走らせる
   await setupRichMenuOnce();
 });
