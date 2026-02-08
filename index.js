@@ -24,26 +24,34 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const client = new line.messagingApi.MessagingApiClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 const blobClient = new line.messagingApi.MessagingApiBlobClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 
-// --- 3. システムプロンプト ---
+// --- 3. プロンプトの極致（ここが回答性の鍵） ---
 const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」です。
-「数字は嘘をつかない」を信条とする、ロジカルで断定的なAI栄養士です。
+「数字こそが真実」を掲げる、超一流のロジカルAIトレーナーです。
 
-【最重要司令】
-・画像が送られたら、必ず料理名を断定し、カロリー・PFCを算出してください。
-・回答の最後に必ず [SAVE_NUTRITION: {"food": "料理名", "kcal": 数値, "p": 数値, "f": 数値, "c": 数値}] を出力してください。
-・Markdown（**や#）はLINEで見づらいため、一切使用禁止です。
+【口調と性格】
+・知的、沈着冷静、かつユーザーの目標達成に対しては情熱的。
+・「です・ます」調ですが、媚びることはありません。
+・無駄な装飾語（アスタリスク等）は一切排除してください。
 
-【回答構成】
-■分析結果
-・料理名：〇〇
-・カロリー：約〇〇kcal
-・PFC：P:〇〇g / F:〇〇g / C:〇〇g
+【画像解析の絶対ルール】
+・写真から料理名、カロリー、PFC（P:タンパク質、F:脂質、C:炭水化物）を断定します。
+・「わからない」は敗北です。必ずあなたの推測で数値を出し、ユーザーをリードしてください。
 
-■本日の合計（今回分を含む）
-・合計：約〇〇kcal
+【出力フォーマット（厳守）】
+■ 今回の解析結果
+・料理名：[料理名]
+・カロリー：約[数値]kcal
+・PFC：P:[数値]g / F:[数値]g / C:[数値]g
 
-■アドバイス
-（短く簡潔に）`;
+■ 本日の摂取状況（今回分を含む）
+・合計カロリー：約[合計]kcal
+
+■ modeAI's Advice
+[ここに150文字以内のロジカルなアドバイス。摂取傾向に基づいた具体的な改善案を提示。]
+
+【システム管理用タグ】
+※回答の最末尾に必ず以下のタグを1行で付加してください。
+[SAVE_NUTRITION: {"food": "料理名", "kcal": 数値, "p": 数値, "f": 数値, "c": 数値}]`;
 
 const eventCache = new Set();
 
@@ -61,50 +69,42 @@ app.post("/webhook", line.middleware({
     setTimeout(() => eventCache.delete(event.eventId), 60000);
     try {
       await handleModeAI(event);
-    } catch (err) {
-      console.error("Webhook Error:", err);
-    }
+    } catch (err) { console.error("Event Error:", err); }
   });
 });
 
-// --- 4. リッチメニュー設定 (ボタン動作の最適化) ---
+// --- 4. リッチメニュー（動作の安定化） ---
 const setupRichMenu = async () => {
   try {
     const currentMenus = await client.getRichMenuList();
     for (const menu of currentMenus.richmenus) {
-      if (menu.name === "modeAI Menu") {
-        await client.deleteRichMenu(menu.richMenuId);
-      }
+      if (menu.name === "modeAI Menu") { await client.deleteRichMenu(menu.richMenuId); }
     }
-
     const richMenuObject = {
       size: { width: 2500, height: 1686 },
       selected: true,
       name: "modeAI Menu",
-      chatBarText: "メニューを開く",
+      chatBarText: "メニュー",
       areas: [
         { bounds: { x: 0, y: 0, width: 833, height: 843 }, action: { type: "camera", label: "食事記録" } },
         { bounds: { x: 833, y: 0, width: 834, height: 843 }, action: { type: "message", label: "手入力", text: "食事を手入力します" } },
-        { bounds: { x: 1667, y: 0, width: 833, height: 843 }, action: { type: "message", label: "合計", text: "今日の合計カロリーを教えて" } },
-        { bounds: { x: 0, y: 843, width: 833, height: 843 }, action: { type: "message", label: "分析", text: "今の摂取傾向を分析して" } },
-        { bounds: { x: 833, y: 843, width: 834, height: 843 }, action: { type: "message", label: "設定", text: "目標設定を変更したい" } },
-        { bounds: { x: 1667, y: 843, width: 833, height: 843 }, action: { type: "message", label: "ヘルプ", text: "使い方を教えて" } }
+        { bounds: { x: 1667, y: 0, width: 833, height: 843 }, action: { type: "message", label: "合計", text: "今日の合計摂取量を教えて" } },
+        { bounds: { x: 0, y: 843, width: 833, height: 843 }, action: { type: "message", label: "分析", text: "これまでの摂取傾向を詳しく分析して" } },
+        { bounds: { x: 833, y: 843, width: 834, height: 843 }, action: { type: "message", label: "設定", text: "目標設定の変更をお願いします" } },
+        { bounds: { x: 1667, y: 843, width: 833, height: 843 }, action: { type: "message", label: "ヘルプ", text: "modeAIの使い方を教えて" } }
       ]
     };
-
     const richMenuId = await client.createRichMenu(richMenuObject);
     const imagePath = path.join(__dirname, "richmenu.jpg");
     if (fs.existsSync(imagePath)) {
       const buffer = fs.readFileSync(imagePath);
-      const blob = new Blob([buffer], { type: "image/jpeg" });
-      await blobClient.setRichMenuImage(richMenuId.richMenuId, blob);
+      await blobClient.setRichMenuImage(richMenuId.richMenuId, new Blob([buffer], { type: "image/jpeg" }));
     }
     await client.setDefaultRichMenu(richMenuId.richMenuId);
-    console.log("✅ Rich Menu Setup Done");
-  } catch (e) { console.error("Rich Menu Error:", e.message); }
+  } catch (e) { console.error("Menu Setup Error:", e); }
 };
 
-// --- 5. メインロジック (集計・クリーンアップ) ---
+// --- 5. メインロジック（高品質化） ---
 async function handleModeAI(event) {
   const userId = event.source.userId;
   if (event.type !== "message") return;
@@ -113,42 +113,40 @@ async function handleModeAI(event) {
   if (event.message.type === "text") {
     userContent = [{ type: "text", text: event.message.text }];
   } else if (event.message.type === "image") {
-    await client.pushMessage({ to: userId, messages: [{ type: "text", text: "modeAIが画像を分析しています...🍳" }] });
+    await client.pushMessage({ to: userId, messages: [{ type: "text", text: "画像を分析中... データを照合しています。" }] });
     const blob = await blobClient.getMessageContent(event.message.id);
     const chunks = [];
     for await (const chunk of blob) { chunks.push(chunk); }
     const buffer = Buffer.concat(chunks);
     userContent = [
-      { type: "text", text: "この写真を分析せよ。必ず数値を断定し [SAVE_NUTRITION] タグを出力せよ。" },
+      { type: "text", text: "この写真を分析し、カロリーとPFCを断定してください。[SAVE_NUTRITION]タグの付与を忘れないでください。" },
       { type: "image_url", image_url: { url: `data:image/jpeg;base64,${buffer.toString("base64")}` } }
     ];
   } else return;
 
   try {
-    // 今日の合計を取得
+    // 今日の合計値を計算
     const now = new Date();
-    const jstOffset = 9 * 60 * 60 * 1000;
-    const todayStartJst = new Date(now.getTime() + jstOffset);
-    todayStartJst.setUTCHours(0, 0, 0, 0);
-    const queryStartUtc = new Date(todayStartJst.getTime() - jstOffset);
+    const jstNow = new Date(now.getTime() + (9 * 60 * 60 * 1000));
+    const startOfToday = new Date(jstNow.setUTCHours(0, 0, 0, 0));
+    const queryStart = new Date(startOfToday.getTime() - (9 * 60 * 60 * 1000));
 
-    const logSnap = await db.collection("users").doc(userId).collection("nutrition_logs")
-      .where("createdAt", ">=", queryStartUtc).get();
-
-    let todayTotalKcal = 0;
-    logSnap.forEach(doc => { todayTotalKcal += (Number(doc.data().kcal) || 0); });
-
-    const dynamicSystemPrompt = `${SYSTEM_PROMPT}\n\n【システムデータ】本日の既摂取カロリー: ${todayTotalKcal}kcal`;
+    const snap = await db.collection("users").doc(userId).collection("nutrition_logs").where("createdAt", ">=", queryStart).get();
+    let totalKcal = 0;
+    snap.forEach(doc => { totalKcal += (Number(doc.data().kcal) || 0); });
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4o",
-      messages: [{ role: "system", content: dynamicSystemPrompt }, { role: "user", content: userContent }],
-      temperature: 0.7
+      messages: [
+        { role: "system", content: `${SYSTEM_PROMPT}\n\n【重要：現在の統計】本日のこれまでの摂取カロリー: ${totalKcal}kcal` },
+        { role: "user", content: userContent }
+      ],
+      temperature: 0.3 // 回答のブレを抑え、安定性を向上
     });
 
     let aiResponse = completion.choices[0].message.content || "";
 
-    // 保存処理
+    // データの保存
     const match = aiResponse.match(/\[SAVE_NUTRITION: (\{[\s\S]*?\})\]/);
     if (match) {
       try {
@@ -157,20 +155,22 @@ async function handleModeAI(event) {
           ...data,
           createdAt: admin.firestore.FieldValue.serverTimestamp()
         });
-      } catch (e) {}
+      } catch (e) { console.error("JSON Parse Error:", e); }
     }
 
-    // 表示のクリーンアップ（アスタリスク除去、タグ除去）
-    let cleanResponse = aiResponse.replace(/\[SAVE_.*?\]/g, "").replace(/\*/g, "").trim();
-    
-    await client.pushMessage({ to: userId, messages: [{ type: "text", text: cleanResponse }] });
+    // 表示の徹底洗浄
+    let finalOutput = aiResponse
+      .replace(/\[SAVE_.*?\]/g, "") // タグ除去
+      .replace(/\*/g, "")           // アスタリスク除去
+      .replace(/#/g, "")            // ハッシュタグ除去
+      .trim();
 
-  } catch (error) {
-    console.error("Error:", error);
-  }
+    await client.pushMessage({ to: userId, messages: [{ type: "text", text: finalOutput }] });
+
+  } catch (error) { console.error("Main Logic Error:", error); }
 }
 
 app.listen(PORT, "0.0.0.0", async () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`Server started on port ${PORT}`);
   await setupRichMenu();
 });
