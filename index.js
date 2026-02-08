@@ -273,3 +273,44 @@ async function streamToBuffer(stream) {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server is running on port ${PORT}`);
 });
+
+// --- サーバー起動時にリッチメニューを自動設定する関数 ---
+const setupRichMenuOnce = async () => {
+  try {
+    const richMenuObject = {
+      size: { width: 2500, height: 1686 },
+      selected: true,
+      name: "modeAI Main Menu",
+      chatBarText: "メニューを開く",
+      areas: [
+        { bounds: { x: 0, y: 0, width: 833, height: 843 }, action: { type: "camera", label: "食事記録" } },
+        { bounds: { x: 833, y: 0, width: 834, height: 843 }, action: { type: "message", label: "手動入力", text: "食事を手入力します" } },
+        { bounds: { x: 1667, y: 0, width: 833, height: 843 }, action: { type: "message", label: "今日の合計", text: "今日の合計カロリーを教えて" } },
+        { bounds: { x: 0, y: 843, width: 833, height: 843 }, action: { type: "message", label: "データ分析", text: "データ分析機能は現在開発中です" } },
+        { bounds: { x: 833, y: 843, width: 834, height: 843 }, action: { type: "message", label: "設定", text: "目標設定を変更したい" } },
+        { bounds: { x: 1667, y: 843, width: 833, height: 843 }, action: { type: "message", label: "ヘルプ", text: "使い方を教えて" } }
+      ]
+    };
+
+    // 1. メニュー作成
+    const richMenuId = await client.createRichMenu(richMenuObject);
+    
+    // 2. 画像設定 (richmenu.jpg が GitHub上にあることが前提)
+    const buffer = fs.readFileSync("./richmenu.jpg");
+    const blob = new Blob([buffer], { type: "image/jpeg" });
+    await blobClient.setRichMenuImage(richMenuId.richMenuId, blob);
+    
+    // 3. デフォルトに設定
+    await client.setDefaultRichMenu(richMenuId.richMenuId);
+    console.log("✅ Rich Menu has been automatically set up!");
+  } catch (e) {
+    console.log("Rich Menu Setup Skip (Already exists or error):", e.message);
+  }
+};
+
+// サーバー起動直後に実行
+app.listen(PORT, "0.0.0.0", async () => {
+  console.log(`Server is running on port ${PORT}`);
+  // 起動時にリッチメニュー設定を走らせる
+  await setupRichMenuOnce();
+});
