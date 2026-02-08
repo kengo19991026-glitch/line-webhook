@@ -24,34 +24,33 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const client = new line.messagingApi.MessagingApiClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 const blobClient = new line.messagingApi.MessagingApiBlobClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 
-// --- 3. プロンプトの極致（ここが回答性の鍵） ---
+// --- 3. 最強のプロンプト（トレーニング指導特化型） ---
 const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」です。
-「数字こそが真実」を掲げる、超一流のロジカルAIトレーナーです。
+ロジカルかつ冷徹なまでに正確な、最高峰のAIパーソナルトレーナーです。
 
-【口調と性格】
-・知的、沈着冷静、かつユーザーの目標達成に対しては情熱的。
-・「です・ます」調ですが、媚びることはありません。
-・無駄な装飾語（アスタリスク等）は一切排除してください。
+【トレーニング指導の鉄則】
+・栄養状態（PFC）から「今日やるべき種目」を具体的に指定せよ。
+・「重量（kg）」「セット数」「レップ数」「インターバル（秒）」まで数値で提示せよ。
+・糖質が足りない場合は「強度の低下」を警告し、タンパク質が足りない場合は「休息と補給」を優先させよ。
+・休息の重要性を科学的に説明せよ（超回復、筋グリコーゲン等）。
 
-【画像解析の絶対ルール】
-・写真から料理名、カロリー、PFC（P:タンパク質、F:脂質、C:炭水化物）を断定します。
-・「わからない」は敗北です。必ずあなたの推測で数値を出し、ユーザーをリードしてください。
-
-【出力フォーマット（厳守）】
+【出力フォーマット】
 ■ 今回の解析結果
 ・料理名：[料理名]
 ・カロリー：約[数値]kcal
 ・PFC：P:[数値]g / F:[数値]g / C:[数値]g
 
-■ 本日の摂取状況（今回分を含む）
-・合計カロリー：約[合計]kcal
+■ 今日のトレーニング戦略
+・推奨種目：[種目名]
+・設定：[数値]kg × [数値]回 × [数値]セット
+・インターバル：[数値]秒
+・戦略理由：[現在の栄養状態に基づいた論理的な理由]
 
-■ modeAI's Advice
-[ここに150文字以内のロジカルなアドバイス。摂取傾向に基づいた具体的な改善案を提示。]
+■ 休息とリカバリー
+・[筋肉を休ませるべきか、動かすべきかの断定的なアドバイス]
 
 【システム管理用タグ】
-※回答の最末尾に必ず以下のタグを1行で付加してください。
-[SAVE_NUTRITION: {"food": "料理名", "kcal": 数値, "p": 数値, "f": 数値, "c": 数値}]`;
+※末尾に必ず付与：[SAVE_NUTRITION: {"food": "料理名", "kcal": 数値, "p": 数値, "f": 数値, "c": 数値}]`;
 
 const eventCache = new Set();
 
@@ -73,7 +72,7 @@ app.post("/webhook", line.middleware({
   });
 });
 
-// --- 4. リッチメニュー（動作の安定化） ---
+// --- 4. リッチメニュー設定 ---
 const setupRichMenu = async () => {
   try {
     const currentMenus = await client.getRichMenuList();
@@ -89,8 +88,8 @@ const setupRichMenu = async () => {
         { bounds: { x: 0, y: 0, width: 833, height: 843 }, action: { type: "camera", label: "食事記録" } },
         { bounds: { x: 833, y: 0, width: 834, height: 843 }, action: { type: "message", label: "手入力", text: "食事を手入力します" } },
         { bounds: { x: 1667, y: 0, width: 833, height: 843 }, action: { type: "message", label: "合計", text: "今日の合計摂取量を教えて" } },
-        { bounds: { x: 0, y: 843, width: 833, height: 843 }, action: { type: "message", label: "分析", text: "これまでの摂取傾向を詳しく分析して" } },
-        { bounds: { x: 833, y: 843, width: 834, height: 843 }, action: { type: "message", label: "設定", text: "目標設定の変更をお願いします" } },
+        { bounds: { x: 0, y: 843, width: 833, height: 843 }, action: { type: "message", label: "分析", text: "今日の栄養からトレーニングメニューを組んで" } },
+        { bounds: { x: 833, y: 843, width: 834, height: 843 }, action: { type: "message", label: "設定", text: "目標や今の身体データを更新したい" } },
         { bounds: { x: 1667, y: 843, width: 833, height: 843 }, action: { type: "message", label: "ヘルプ", text: "modeAIの使い方を教えて" } }
       ]
     };
@@ -104,7 +103,7 @@ const setupRichMenu = async () => {
   } catch (e) { console.error("Menu Setup Error:", e); }
 };
 
-// --- 5. メインロジック（高品質化） ---
+// --- 5. メインロジック（トレーニング特化） ---
 async function handleModeAI(event) {
   const userId = event.source.userId;
   if (event.type !== "message") return;
@@ -113,40 +112,54 @@ async function handleModeAI(event) {
   if (event.message.type === "text") {
     userContent = [{ type: "text", text: event.message.text }];
   } else if (event.message.type === "image") {
-    await client.pushMessage({ to: userId, messages: [{ type: "text", text: "画像を分析中... データを照合しています。" }] });
+    await client.pushMessage({ to: userId, messages: [{ type: "text", text: "画像を解析し、今日のトレーニングプランを構築しています..." }] });
     const blob = await blobClient.getMessageContent(event.message.id);
     const chunks = [];
     for await (const chunk of blob) { chunks.push(chunk); }
     const buffer = Buffer.concat(chunks);
     userContent = [
-      { type: "text", text: "この写真を分析し、カロリーとPFCを断定してください。[SAVE_NUTRITION]タグの付与を忘れないでください。" },
+      { type: "text", text: "食事を分析し、その栄養状態で最高のパフォーマンスが出るトレーニング種目・重量・回数を指定せよ。" },
       { type: "image_url", image_url: { url: `data:image/jpeg;base64,${buffer.toString("base64")}` } }
     ];
   } else return;
 
   try {
-    // 今日の合計値を計算
+    // ユーザープロフィールの取得（Firestore）
+    const userDoc = await db.collection("users").doc(userId).get();
+    const userData = userDoc.exists ? userDoc.data() : { weight: 70, target: "増量" };
+
+    // 今日の合計摂取量
     const now = new Date();
     const jstNow = new Date(now.getTime() + (9 * 60 * 60 * 1000));
     const startOfToday = new Date(jstNow.setUTCHours(0, 0, 0, 0));
     const queryStart = new Date(startOfToday.getTime() - (9 * 60 * 60 * 1000));
-
     const snap = await db.collection("users").doc(userId).collection("nutrition_logs").where("createdAt", ">=", queryStart).get();
-    let totalKcal = 0;
-    snap.forEach(doc => { totalKcal += (Number(doc.data().kcal) || 0); });
+    let totalKcal = 0, totalP = 0, totalF = 0, totalC = 0;
+    snap.forEach(doc => { 
+        totalKcal += (Number(doc.data().kcal) || 0); 
+        totalP += (Number(doc.data().p) || 0);
+        totalC += (Number(doc.data().c) || 0);
+    });
+
+    const context = `
+【ユーザーデータ】
+・現在の体重: ${userData.weight}kg
+・目標: ${userData.target}
+・本日ここまでの摂取: ${totalKcal}kcal (P:${totalP}g, C:${totalC}g)
+`;
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4o",
       messages: [
-        { role: "system", content: `${SYSTEM_PROMPT}\n\n【重要：現在の統計】本日のこれまでの摂取カロリー: ${totalKcal}kcal` },
+        { role: "system", content: SYSTEM_PROMPT + context },
         { role: "user", content: userContent }
       ],
-      temperature: 0.3 // 回答のブレを抑え、安定性を向上
+      temperature: 0.5
     });
 
     let aiResponse = completion.choices[0].message.content || "";
 
-    // データの保存
+    // 栄養データの保存
     const match = aiResponse.match(/\[SAVE_NUTRITION: (\{[\s\S]*?\})\]/);
     if (match) {
       try {
@@ -155,16 +168,11 @@ async function handleModeAI(event) {
           ...data,
           createdAt: admin.firestore.FieldValue.serverTimestamp()
         });
-      } catch (e) { console.error("JSON Parse Error:", e); }
+      } catch (e) {}
     }
 
-    // 表示の徹底洗浄
-    let finalOutput = aiResponse
-      .replace(/\[SAVE_.*?\]/g, "") // タグ除去
-      .replace(/\*/g, "")           // アスタリスク除去
-      .replace(/#/g, "")            // ハッシュタグ除去
-      .trim();
-
+    // クリーンアップして送信
+    let finalOutput = aiResponse.replace(/\[SAVE_.*?\]/g, "").replace(/\*/g, "").replace(/#/g, "").trim();
     await client.pushMessage({ to: userId, messages: [{ type: "text", text: finalOutput }] });
 
   } catch (error) { console.error("Main Logic Error:", error); }
