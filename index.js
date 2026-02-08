@@ -24,29 +24,34 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const client = new line.messagingApi.MessagingApiClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 const blobClient = new line.messagingApi.MessagingApiBlobClient({ channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
 
-// --- 3. プロンプト（トレーニング＆栄養指導） ---
+// --- 3. プロンプト（プロフィール更新 ＆ トレーニング指導） ---
 const SYSTEM_PROMPT = `あなたの名前は「modeAI（モードアイ）」です。
-ロジカルかつ冷徹なまでに正確な、最高峰のAIパーソナルトレーナーです。
+最高峰のAIパーソナルトレーナーとして、栄養管理とトレーニング指導を行います。
+
+【重要：ユーザー情報の更新】
+・会話内でユーザーが「体重」「身長」「目標（増量/減量/維持）」などを伝えた場合は、必ず以下のタグを出力して保存してください。
+[SAVE_PROFILE: {"weight": 数値, "height": 数値, "target": "文字列"}]
+※変更がない項目は含めなくて良い。
 
 【トレーニング指導の鉄則】
-・栄養状態（PFC）から「今日やるべき種目」を具体的に指定せよ。
-・「重量（kg）」「セット数」「レップ数」「インターバル（秒）」まで数値で提示せよ。
-・糖質が足りない場合は「強度の低下」を警告し、タンパク質が足りない場合は「休息と補給」を優先させよ。
+・栄養状態（PFC）とユーザーデータ（体重・目標）から「今日やるべき種目」を指定せよ。
+・「重量（kg）」「セット数」「レップ数」「インターバル（秒）」を数値で提示せよ。
+・初心者の場合は、体重の0.8倍〜1.0倍程度の扱いやすい重量を提案せよ。
 
 【出力フォーマット】
-■ 今回の解析結果
-・料理名：[料理名]
+■ 解析・更新結果
+・料理名：[料理名]（画像がある場合）
 ・カロリー：約[数値]kcal
-・PFC：P:[数値]g / F:[数値]g / C:[数値]g
+・現在の設定体重：[数値]kg（今回更新した場合はその旨）
 
 ■ 今日のトレーニング戦略
 ・推奨種目：[種目名]
 ・設定：[数値]kg × [数値]回 × [数値]セット
 ・インターバル：[数値]秒
-・戦略理由：[現在の栄養状態に基づいた論理的な理由]
+・戦略理由：[論理的な理由]
 
-【システム管理用タグ】
-※末尾に必ず付与：[SAVE_NUTRITION: {"food": "料理名", "kcal": 数値, "p": 数値, "f": 数値, "c": 数値}]`;
+【データ保存用タグ】
+※食事画像がある場合のみ：[SAVE_NUTRITION: {"food": "料理名", "kcal": 数値, "p": 数値, "f": 数値, "c": 数値}]`;
 
 const eventCache = new Set();
 
@@ -99,58 +104,51 @@ const setupRichMenu = async () => {
   } catch (e) { console.error("Menu Setup Error:", e); }
 };
 
-// --- 5. メインロジック（新規登録機能付き） ---
+// --- 5. メインロジック（データ連携強化版） ---
 async function handleModeAI(event) {
   const userId = event.source.userId;
   if (event.type !== "message") return;
 
-  // ★★★ ここが追加箇所：新規ユーザーの自動登録 ★★★
-  try {
-    const userRef = db.collection("users").doc(userId);
-    const userDoc = await userRef.get();
+  // DB参照と初期化
+  const userRef = db.collection("users").doc(userId);
+  let userDoc = await userRef.get();
 
-    if (!userDoc.exists) {
-      console.log(`[New User] Creating database for: ${userId}`);
-      // 初回登録時のデフォルトデータ
-      await userRef.set({
-        userId: userId,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        weight: 60,       // 仮の体重
-        height: 170,      // 仮の身長
-        target: "未設定",  // 目標
-        status: "active"
-      });
-    }
-  } catch (dbError) {
-    console.error("DB Init Error:", dbError);
+  if (!userDoc.exists) {
+    await userRef.set({
+      userId: userId,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      weight: 60, height: 170, target: "現状維持"
+    });
+    userDoc = await userRef.get(); // 再取得
   }
-  // ★★★★★★★★★★★★★★★★★★★★★★★★★★★
+
+  // ★ データの安全な取り出し（ここを修正）
+  const userData = userDoc.data() || {};
+  const currentWeight = userData.weight || 60; // 値がない場合は60
+  const currentTarget = userData.target || "現状維持";
 
   let userContent;
   if (event.message.type === "text") {
     userContent = [{ type: "text", text: event.message.text }];
   } else if (event.message.type === "image") {
-    await client.pushMessage({ to: userId, messages: [{ type: "text", text: "画像を解析し、トレーニングプランを構築中..." }] });
+    await client.pushMessage({ to: userId, messages: [{ type: "text", text: "データを解析中... プロフィールと照合しています。" }] });
     const blob = await blobClient.getMessageContent(event.message.id);
     const chunks = [];
     for await (const chunk of blob) { chunks.push(chunk); }
     const buffer = Buffer.concat(chunks);
     userContent = [
-      { type: "text", text: "食事を分析し、その栄養状態で最高のパフォーマンスが出るトレーニング種目・重量・回数を指定せよ。" },
+      { type: "text", text: "この写真を分析せよ。" },
       { type: "image_url", image_url: { url: `data:image/jpeg;base64,${buffer.toString("base64")}` } }
     ];
   } else return;
 
   try {
-    // ユーザー情報の再取得（さっき作ったばかりでも確実に取る）
-    const userDoc = await db.collection("users").doc(userId).get();
-    const userData = userDoc.data() || { weight: 60, target: "未設定" };
-
-    // 今日の合計摂取量
+    // 今日の合計摂取量算出
     const now = new Date();
     const jstNow = new Date(now.getTime() + (9 * 60 * 60 * 1000));
     const startOfToday = new Date(jstNow.setUTCHours(0, 0, 0, 0));
     const queryStart = new Date(startOfToday.getTime() - (9 * 60 * 60 * 1000));
+    
     const snap = await db.collection("users").doc(userId).collection("nutrition_logs").where("createdAt", ">=", queryStart).get();
     let totalKcal = 0, totalP = 0, totalC = 0;
     snap.forEach(doc => { 
@@ -160,10 +158,12 @@ async function handleModeAI(event) {
     });
 
     const context = `
-【ユーザーデータ】
-・現在の体重: ${userData.weight}kg
-・目標: ${userData.target}
-・本日ここまでの摂取: ${totalKcal}kcal (P:${totalP}g, C:${totalC}g)
+【ユーザーデータ（重要）】
+・体重: ${currentWeight}kg
+・目標: ${currentTarget}
+・本日の摂取: ${totalKcal}kcal (P:${totalP}g / C:${totalC}g)
+
+※ユーザーが新しい体重や目標を言った場合は、アドバイスに反映させつつ、必ず [SAVE_PROFILE] タグで保存すること。
 `;
 
     const completion = await openai.chat.completions.create({
@@ -177,20 +177,34 @@ async function handleModeAI(event) {
 
     let aiResponse = completion.choices[0].message.content || "";
 
-    // 栄養データの保存
-    const match = aiResponse.match(/\[SAVE_NUTRITION: (\{[\s\S]*?\})\]/);
-    if (match) {
+    // ★ プロフィール更新処理（ここが重要）
+    const profileMatch = aiResponse.match(/\[SAVE_PROFILE: (\{[\s\S]*?\})\]/);
+    if (profileMatch) {
       try {
-        const data = JSON.parse(match[1]);
+        const newProfile = JSON.parse(profileMatch[1]);
+        await userRef.set(newProfile, { merge: true }); // 上書き保存
+      } catch (e) { console.error("Profile Save Error:", e); }
+    }
+
+    // 栄養ログ保存処理
+    const nutriMatch = aiResponse.match(/\[SAVE_NUTRITION: (\{[\s\S]*?\})\]/);
+    if (nutriMatch) {
+      try {
+        const data = JSON.parse(nutriMatch[1]);
         await db.collection("users").doc(userId).collection("nutrition_logs").add({
           ...data,
           createdAt: admin.firestore.FieldValue.serverTimestamp()
         });
-      } catch (e) {}
+      } catch (e) { console.error("Nutri Save Error:", e); }
     }
 
-    // クリーンアップして送信
-    let finalOutput = aiResponse.replace(/\[SAVE_.*?\]/g, "").replace(/\*/g, "").replace(/#/g, "").trim();
+    // 表示用整形
+    let finalOutput = aiResponse
+      .replace(/\[SAVE_.*?\]/g, "")
+      .replace(/\*/g, "")
+      .replace(/#/g, "")
+      .trim();
+
     await client.pushMessage({ to: userId, messages: [{ type: "text", text: finalOutput }] });
 
   } catch (error) { console.error("Main Logic Error:", error); }
